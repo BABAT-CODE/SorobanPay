@@ -21,7 +21,8 @@ import {
 } from '@stellar/stellar-sdk';
 import { SorobanRpc } from '@stellar/stellar-sdk';
 import { signTx } from './wallet_manager';
-import { isValidCAddress, isValidGAddress } from './validation';
+import { isValidCAddress, isValidGAddress, validateTransactionSize } from './validation';
+import { MAX_OPERATIONS_PER_TX, MAX_TX_BYTE_SIZE } from '@/constants/network';
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -113,6 +114,21 @@ export async function buildAndSubmitSubscribe(
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : String(err);
     throw new Error(`Transaction preparation failed: ${msg}`);
+  }
+
+  // 3b. Preflight: validate operation count and XDR payload size against
+  //     network limits before the wallet signing prompt opens.
+  //     Limits are sourced from constants/network.ts (env vars with protocol defaults).
+  const preparedXdr = preparedTx.toXDR();
+  const operationCount = preparedTx.operations.length;
+  const sizeCheck = validateTransactionSize(
+    preparedXdr,
+    operationCount,
+    MAX_OPERATIONS_PER_TX,
+    MAX_TX_BYTE_SIZE,
+  );
+  if (!sizeCheck.ok) {
+    throw new Error(`Transaction size limit exceeded: ${sizeCheck.error}`);
   }
 
   // 4. Sign with Freighter

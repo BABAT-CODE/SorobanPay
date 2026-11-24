@@ -686,6 +686,21 @@ function classifyError(err: unknown): TxErrorInfo {
     };
   }
   if (
+    msg.includes("transaction size limit exceeded") ||
+    msg.includes("exceeds the network limit")
+  ) {
+    // Extract actionable detail from the error message if present
+    const detail = raw.replace(/^transaction size limit exceeded:\s*/i, '');
+    return {
+      title: "Transaction too large",
+      summary:
+        "The transaction exceeds the network's size or operation limit and cannot be signed.",
+      fix: detail ||
+        "Split the payment batch into smaller groups and submit each one separately.",
+      raw,
+    };
+  }
+  if (
     msg.includes("intervaltoo") ||
     msg.includes("error(contract, #2)") ||
     msg.includes("error(contract, #3)")
