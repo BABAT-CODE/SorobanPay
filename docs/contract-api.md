@@ -16,6 +16,7 @@ Full reference for all `SubscriptionProtocol` entry points, types, and error cod
    - [execute_payment](#execute_payment)
    - [batch_execute_payment](#batch_execute_payment)
    - [cancel](#cancel)
+  - [expire_subscription](#expire_subscription)
    - [get_subscription](#get_subscription)
    - [initialize](#initialize)
    - [migrate](#migrate)
@@ -445,6 +446,28 @@ fn test_cancel_removes_subscription() {
 
 ---
 
+### `expire_subscription`
+
+Remove a subscription after its `overdue_since` timestamp plus `grace_period` has elapsed. Anyone may call this entry point; success removes the persistent record and merchant index entry and emits `expired` with subscriber, merchant, and token topics.
+
+**Authorization:** None required.
+
+#### Parameters
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `subscriber` | `Address` | Subscriber whose record is expired |
+| `merchant` | `Address` | Merchant in the subscription pair |
+
+#### Errors
+
+| Error | Code | Trigger |
+|-------|------|---------|
+| `NoActiveSubscription` | 4 | No record exists for the pair |
+| `GracePeriodNotElapsed` | 19 | No overdue timestamp is set or the grace period remains active |
+
+---
+
 ### `get_subscription`
 
 Query active subscription details for a subscriber-merchant pair. This is a read-only call; it requires no authorization. As a side effect, it extends the entry's TTL if it is below the minimum threshold.
@@ -538,7 +561,7 @@ stellar contract invoke \
 
 ### `migrate`
 
-Upgrade the on-chain schema version to `CURRENT_SCHEMA_VERSION`. Returns `AlreadyMigrated` if the contract is already at the current version. Emits `contract_migrated`.
+Rewrite the listed subscription records using the current schema, defaulting newly added optional fields, then store `CURRENT_SCHEMA_VERSION`. Calling migration again for the current version is safe. Emits `contract_migrated` when the schema version advances.
 
 **Authorization:** `admin` (the address stored by `initialize`) must sign.
 
@@ -547,6 +570,7 @@ Upgrade the on-chain schema version to `CURRENT_SCHEMA_VERSION`. Returns `Alread
 | Parameter | Type | Description |
 |-----------|------|-------------|
 | `admin` | `Address` | Must match the stored admin address |
+| `subscribers` | `Vec<(Address, Address)>` | Subscriber and merchant pairs whose records should be rewritten |
 
 #### Return value
 
@@ -557,8 +581,9 @@ Upgrade the on-chain schema version to `CURRENT_SCHEMA_VERSION`. Returns `Alread
 | Error | Code | Trigger |
 |-------|------|---------|
 | `NotInitialized` | 17 | `initialize` has not been called |
-| `NotAdmin` | 16 | `admin` does not match the stored admin address |
-| `AlreadyMigrated` | 15 | Schema version is already `CURRENT_SCHEMA_VERSION` |
+| `Unauthorized` | 6 | `admin` does not match the stored admin address |
+| `NoActiveSubscription` | 4 | A listed subscriber and merchant pair has no stored subscription |
+| `AlreadyMigrated` | 15 | Stored schema version is newer than this contract |
 
 ---
 
@@ -659,6 +684,7 @@ Complete table of all 17 error codes with trigger conditions, affected entry poi
 | 15 | `AlreadyMigrated` | `migrate` | Schema already at `CURRENT_SCHEMA_VERSION` | No action needed |
 | 16 | `NotAdmin` | `migrate` | Caller ≠ stored admin address | Use the admin identity set during `initialize` |
 | 17 | `NotInitialized` | `migrate` | `initialize` not yet called | Call `initialize(admin)` first |
+| 19 | `GracePeriodNotElapsed` | `expire_subscription` | Overdue timestamp is absent or grace period has not elapsed | Wait until `overdue_since + grace_period` |
 
 ### Errors returned per entry point
 
@@ -668,6 +694,7 @@ Complete table of all 17 error codes with trigger conditions, affected entry poi
 | `execute_payment` | 4, 5, 6, 7, 8 |
 | `batch_execute_payment` | 8, 12, 13 |
 | `cancel` | 4 |
+| `expire_subscription` | 4, 8, 19 |
 | `get_subscription` | _(none — returns `Option`)_ |
 | `migrate` | 15, 16, 17 |
 

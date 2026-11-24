@@ -26,7 +26,7 @@ export function LanguageSelector() {
       // Strip the current locale prefix (if present) from the pathname so we
       // can rebuild it with the new locale. next-intl middleware with
       // localePrefix: 'as-needed' only adds a prefix for non-default locales.
-      const strippedPath = pathname.replace(/^\/(en|es)/, '') || '/';
+      const strippedPath = pathname.replace(new RegExp(`^/(${locales.join('|')})`), '') || '/';
       const nextPath =
         next === 'en' ? strippedPath : `/${next}${strippedPath}`;
       router.push(nextPath);
@@ -37,7 +37,7 @@ export function LanguageSelector() {
     <div className="inline-flex items-center gap-2">
       <label
         htmlFor="language-selector"
-        className="text-xs text-gray-400 font-medium select-none"
+        className="text-xs text-gray-500 dark:text-gray-400 font-medium select-none"
       >
         {t('label')}
       </label>
@@ -47,9 +47,9 @@ export function LanguageSelector() {
         onChange={handleChange}
         disabled={isPending}
         aria-label={t('label')}
-        className="rounded-lg bg-gray-800 border border-gray-700 px-3 py-1.5 text-xs
-                   text-white cursor-pointer transition-colors
-                   hover:bg-gray-700 focus:outline-none focus-visible:ring-2
+        className="rounded-lg bg-gray-100 dark:bg-gray-800 border border-gray-300 dark:border-gray-700 px-3 py-1.5 text-xs
+                   text-gray-800 dark:text-white cursor-pointer transition-colors
+                   hover:bg-gray-200 dark:hover:bg-gray-700 focus:outline-none focus-visible:ring-2
                    focus-visible:ring-blue-400 disabled:opacity-50"
       >
         {locales.map((loc) => (

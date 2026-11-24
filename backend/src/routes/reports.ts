@@ -28,6 +28,12 @@ import { pipeline } from 'stream/promises';
 import prisma from '../lib/prisma';
 import { validateQuery, reportQuerySchema, ReportQuery } from '../middleware/validation';
 import { redactAddress } from '../lib/logger';
+import {
+  cacheGet,
+  cacheSet,
+  CacheKey,
+  CACHE_TTL,
+} from '../lib/redis';
 
 const router = Router();
 
@@ -164,6 +170,79 @@ function createDbReadable(
 // Route handler
 // ---------------------------------------------------------------------------
 
+/**
+ * @openapi
+ * /api/v1/reports/payments:
+ *   get:
+ *     operationId: exportPayments
+ *     summary: Export payment history as CSV or JSON (streaming)
+ *     description: |
+ *       Streams payment history row-by-row to avoid buffering large datasets.
+ *       CSV exports include columns: Date, Subscriber, Token, Amount (human), Amount (raw), Tx Hash, Status.
+ *       Rate limited to 1 request per minute per IP.
+ *     tags: [Reports]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - name: merchant
+ *         in: query
+ *         required: true
+ *         schema:
+ *           $ref: "#/components/schemas/Address"
+ *       - name: format
+ *         in: query
+ *         schema:
+ *           type: string
+ *           enum: [json, csv]
+ *           default: json
+ *       - name: from
+ *         in: query
+ *         schema:
+ *           $ref: "#/components/schemas/IsoDate"
+ *         description: Start date (inclusive)
+ *       - name: to
+ *         in: query
+ *         schema:
+ *           $ref: "#/components/schemas/IsoDate"
+ *         description: End date (inclusive)
+ *       - name: status
+ *         in: query
+ *         schema:
+ *           type: string
+ *           enum: [all, success, failed]
+ *           default: all
+ *       - name: limit
+ *         in: query
+ *         schema:
+ *           type: integer
+ *           default: 10000
+ *           maximum: 100000
+ *       - name: offset
+ *         in: query
+ *         schema:
+ *           type: integer
+ *           default: 0
+ *     responses:
+ *       "200":
+ *         description: Payment history (CSV or JSON)
+ *         content:
+ *           text/csv:
+ *             schema:
+ *               type: string
+ *           application/json:
+ *             schema:
+ *               type: array
+ *               items:
+ *                 $ref: "#/components/schemas/CsvExportRow"
+ *       "400":
+ *         description: Invalid parameters
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: "#/components/schemas/Error"
+ *       "429":
+ *         description: Rate limit exceeded
+ */
 router.get(
   '/',
   validateQuery(reportQuerySchema),
@@ -177,6 +256,22 @@ router.get(
       format: query.format,
       status: query.status,
     });
+
+    // ── Cache-aside for JSON requests (not streaming CSV) ─────────────────
+    // CSV exports are streamed and typically large; skip caching for them.
+    if (query.format !== 'csv') {
+      const period = `${query.from ?? 'all'}__${query.to ?? 'all'}__${query.status ?? 'all'}__${query.limit ?? 10000}__${query.offset ?? 0}`;
+      const cacheKey = CacheKey.analyticsRevenue(query.merchant, period);
+      const cached = await cacheGet<object[]>(cacheKey);
+      if (cached !== null) {
+        res.setHeader('X-Cache', 'HIT');
+        res.setHeader('Content-Type', 'application/json; charset=utf-8');
+        res.json(cached);
+        return;
+      }
+      // Will be set to MISS below after the DB query
+      (req as any)._analyticsCacheKey = cacheKey;
+    }
 
     // Build Prisma where clause
     const where: Parameters<typeof prisma.auditLog.findMany>[0]['where'] = {
@@ -206,6 +301,8 @@ router.get(
         'Content-Disposition',
         `attachment; filename="payments-${query.merchant.slice(0, 8)}-${Date.now()}.csv"`,
       );
+      // CSV exports are never cached — always fresh from DB
+      res.setHeader('X-Cache', 'MISS');
 
       // Write CSV header immediately
       res.write(toCsvRow(CSV_HEADERS));
@@ -243,7 +340,9 @@ router.get(
     // JSON streaming export
     // -----------------------------------------------------------------------
     res.setHeader('Content-Type', 'application/json; charset=utf-8');
+    res.setHeader('X-Cache', 'MISS');
 
+    const rows: object[] = [];
     res.write('[');
     let first = true;
 
@@ -251,6 +350,7 @@ router.get(
       objectMode: true,
       transform(record, _encoding, callback) {
         const row = toPaymentRow(record);
+        rows.push(row);
         const chunk = (first ? '' : ',') + JSON.stringify(row);
         first = false;
         callback(null, chunk);
@@ -263,9 +363,16 @@ router.get(
       await new Promise<void>((resolve, reject) => {
         source.pipe(jsonTransform);
         jsonTransform.on('data', (chunk: Buffer | string) => res.write(chunk));
-        jsonTransform.on('end', () => {
+        jsonTransform.on('end', async () => {
           res.write(']');
           res.end();
+
+          // Write result to cache after streaming completes
+          const analyticsCacheKey = (req as any)._analyticsCacheKey as string | undefined;
+          if (analyticsCacheKey) {
+            await cacheSet(analyticsCacheKey, rows, CACHE_TTL.analytics).catch(() => {});
+          }
+
           resolve();
         });
         jsonTransform.on('error', reject);

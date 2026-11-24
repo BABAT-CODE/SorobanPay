@@ -6,6 +6,8 @@
 
 A production-grade, non-custodial recurring payments protocol built on Stellar's Soroban smart contract platform. Enables SaaS billing, creator subscriptions, and recurring donations directly on-chain — no custodial wallets, no pre-authorized transaction arrays.
 
+Deploy with `init(admin)` before creating subscriptions. The admin can set a per-deployment amount cap with `set_max_amount`; subscriptions above it return `AmountExceedsLimit` (error 19). `subscribe` accepts an optional grace period; failed collections record `overdue_since`, and anyone can call `expire_subscription` after the grace period.
+
 ---
 
 ## Architecture
@@ -20,7 +22,7 @@ SorobanPay
 ```
 
 **Three layers:**
-1. **Smart Contract** — `SubscriptionProtocol` Soroban contract with `subscribe`, `execute_payment`, and `cancel` entry points. Uses persistent storage with TTL management and emits structured events for off-chain indexing. This is the sole source of truth for subscription state and payment execution — it never holds balances and requires a fresh auth signature on every call.
+1. **Smart Contract** — `SubscriptionProtocol` Soroban contract with 11 implemented entry points (`initialize`, `get_version`, `get_schema_version`, `migrate`, `compute_subscription_key`, `get_merchant_subscription_keys`, `subscribe`, `execute_payment`, `batch_execute_payment`, `cancel`, `get_subscription`). Uses persistent storage with TTL management and emits structured events for off-chain indexing. This is the sole source of truth for subscription state and payment execution — it never holds balances and requires a fresh auth signature on every call.
 2. **Frontend** — Next.js 14 App Router + Freighter wallet integration + Tailwind CSS. Signs and submits transactions directly to Soroban RPC; handles no server-side logic.
 3. **Backend** (`backend/`) — Optional off-chain service for event indexing, cancellation detection, payout summaries, and a merchant REST API. Read-only with respect to the chain — it polls `getEvents()` but never submits transactions. See [docs/architecture.md](docs/architecture.md) for the full backend role definition.
 4. **Build & Deploy** — GNU Makefile + bash deployment script with testnet/mainnet switching.
@@ -36,7 +38,7 @@ SorobanPay
 2. **Frontend** dispatches contract calls (`subscribe`, `cancel`, `execute_payment`) through the Stellar RPC.
 3. **Soroban Contract** executes on-chain, interacting with the **SEP-41 Token** for allowances/transfers and persisting state in the **Soroban Ledger**.
 4. **Structured events** emitted by the contract can be indexed by an **optional backend** for analytics, history, or notification triggers.
-5. **Cancellation audit records** are persisted off-chain by backend services after confirmed `cancel` transactions because the contract does not emit cancellation events.
+5. **Cancellation events** are emitted by the contract on every successful `cancel` call (`symbol("cancel")`, subscriber, merchant topics; unit data), allowing off-chain indexers to immediately detect and record cancellations without scanning storage changes.
 6. **Merchant** may use a dedicated portal or admin panel to trigger `execute_payment` and view subscription state.
 
 ---
@@ -134,6 +136,150 @@ Open http://localhost:3000 in a browser with the [Freighter extension](https://w
 1. In Freighter, switch to Testnet and fund your wallet via [Friendbot](https://laboratory.stellar.org/#account-creator?network=test).
 2. Open the app, enter a merchant address and amount, and click **Subscribe**.
 3. Approve the transaction in Freighter — the subscription is now live on-chain.
+
+---
+
+## Kubernetes Deployment (backend services)
+
+The `deploy/k8s/` directory contains production-grade Kubernetes manifests for the three SorobanPay backend roles:
+
+| Manifest | Workload | Replicas |
+|---|---|---|
+| `indexer-deployment.yaml` | Event indexer — polls Soroban RPC every 5 min | 1 (Recreate) |
+| `api-deployment.yaml` | REST API — subscriptions, webhooks, admin, reports | 2–10 (HPA) |
+| `webhook-worker-deployment.yaml` | Webhook worker — delivers merchant notifications | 2 (RollingUpdate) |
+
+All three run the same `sorobanpay/backend` Docker image; the `SERVICE_ROLE` env var selects the active mode at startup.
+
+### Prerequisites
+
+| Tool | Install |
+|---|---|
+| `kubectl` ≥ 1.28 | https://kubernetes.io/docs/tasks/tools/ |
+| A Kubernetes cluster | minikube, kind, EKS, GKE, AKS, etc. |
+| [nginx-ingress controller](https://kubernetes.github.io/ingress-nginx/) | `kubectl apply -f https://raw.githubusercontent.com/kubernetes/ingress-nginx/controller-v1.11.1/deploy/static/provider/cloud/deploy.yaml` |
+| [cert-manager](https://cert-manager.io/) (TLS) | `kubectl apply -f https://github.com/cert-manager/cert-manager/releases/download/v1.15.1/cert-manager.yaml` |
+| [metrics-server](https://github.com/kubernetes-sigs/metrics-server) (HPA) | `kubectl apply -f https://github.com/kubernetes-sigs/metrics-server/releases/latest/download/components.yaml` |
+
+### Quick start — minikube
+
+```bash
+# 1. Start minikube
+minikube start --cpus=4 --memory=4096
+
+# 2. Enable the nginx ingress addon
+minikube addons enable ingress
+
+# 3. Build the backend image inside minikube's Docker daemon
+eval $(minikube docker-env)
+docker build -t sorobanpay/backend:latest backend/
+
+# 4. Set real secret values (do not commit these to source control)
+kubectl create secret generic sorobanpay-secrets \
+  --from-literal=DATABASE_URL="postgresql://sorobanpay:sorobanpay@postgres:5432/sorobanpay?schema=public" \
+  --from-literal=WEBHOOK_SECRET="$(openssl rand -hex 32)" \
+  --from-literal=ADMIN_JWT_SECRET="$(openssl rand -hex 32)" \
+  -n sorobanpay --dry-run=client -o yaml > /tmp/sorobanpay-secrets.yaml
+# Edit /tmp/sorobanpay-secrets.yaml if needed, then apply after the namespace:
+
+# 5. Apply all manifests (namespace first, then the rest via kustomize)
+kubectl apply -f deploy/k8s/namespace.yaml
+kubectl apply /tmp/sorobanpay-secrets.yaml
+kubectl apply -k deploy/k8s/
+
+# 6. Verify the rollout
+kubectl rollout status deployment/sorobanpay-api     -n sorobanpay
+kubectl rollout status deployment/sorobanpay-indexer -n sorobanpay
+kubectl rollout status deployment/sorobanpay-webhook-worker -n sorobanpay
+
+# 7. Check HPA
+kubectl get hpa -n sorobanpay
+
+# 8. Port-forward to test locally (bypasses Ingress)
+kubectl port-forward svc/sorobanpay-api 8080:80 -n sorobanpay
+curl http://localhost:8080/health
+```
+
+### Quick start — existing cluster (production)
+
+```bash
+# 1. Create the namespace
+kubectl apply -f deploy/k8s/namespace.yaml
+
+# 2. Populate secrets from your secret manager (example: plain kubectl)
+kubectl create secret generic sorobanpay-secrets \
+  --from-literal=DATABASE_URL="postgresql://..." \
+  --from-literal=WEBHOOK_SECRET="$(openssl rand -hex 32)" \
+  --from-literal=ADMIN_JWT_SECRET="$(openssl rand -hex 32)" \
+  -n sorobanpay
+
+# 3. Edit deploy/k8s/configmap.yaml — set CONTRACT_ID, RPC_URL, and API_BASE_URL
+
+# 4. Edit deploy/k8s/api-service.yaml — replace api.sorobanpay.example.com with your domain
+
+# 5. Apply everything
+kubectl apply -k deploy/k8s/
+
+# 6. Watch pods come up
+kubectl get pods -n sorobanpay -w
+```
+
+### Updating the image tag
+
+Use `kustomize edit` to pin a specific release without editing manifests by hand:
+
+```bash
+cd deploy/k8s
+kustomize edit set image sorobanpay/backend=sorobanpay/backend:v1.2.3
+kubectl apply -k .
+```
+
+### Directory structure
+
+```
+deploy/k8s/
+├── namespace.yaml                  # sorobanpay namespace
+├── configmap.yaml                  # Non-secret env vars (RPC_URL, CONTRACT_ID, …)
+├── secrets.yaml                    # Placeholder secrets — replace with real values
+├── indexer-deployment.yaml         # Event indexer (1 replica, Recreate)
+├── api-deployment.yaml             # REST API (2 replicas min, HPA to 10)
+├── webhook-worker-deployment.yaml  # Webhook worker (2 replicas)
+├── api-service.yaml                # ClusterIP service + Ingress with TLS
+├── hpa.yaml                        # HPA: CPU ≥ 70% or Memory ≥ 80%
+├── postgres-statefulset.yaml       # PostgreSQL (dev/CI only — use managed DB in prod)
+├── redis-statefulset.yaml          # Redis reference (not yet used — future roadmap)
+└── kustomization.yaml              # Kustomize root — applies all of the above
+```
+
+### Secret management
+
+The provided `secrets.yaml` contains **placeholder base64-encoded values** and must never be applied as-is to a real cluster. Recommended approaches:
+
+- **External Secrets Operator** (recommended): sync from AWS Secrets Manager, GCP Secret Manager, or HashiCorp Vault. Replace `secrets.yaml` with an `ExternalSecret` CRD.
+- **Sealed Secrets**: `kubeseal --format yaml < secrets.yaml > secrets-sealed.yaml` — safe to commit.
+- **`kubectl create secret`**: generate secrets on-the-fly in your CI/CD pipeline, never touching disk.
+
+See [docs/security.md](docs/security.md) for full guidance on managing backend secrets.
+
+### Health probes
+
+All three deployments expose `/health` on port 3001. Kubernetes uses this endpoint for liveness, readiness, and startup probes. The health handler verifies:
+1. Soroban RPC reachability (`getHealth`)
+2. Contract address resolvability (`getContractData`)
+
+A pod will not receive traffic and will be restarted if either check fails consistently. See `backend/src/routes/health.ts` for the implementation.
+
+### Observability
+
+Prometheus annotations are set on all pods:
+
+```
+prometheus.io/scrape: "true"
+prometheus.io/port:   "3001"
+prometheus.io/path:   "/metrics"
+```
+
+If you use the prometheus-operator, create a `ServiceMonitor` targeting the `sorobanpay-api` service. The Grafana dashboard in `deploy/grafana/sorobanpay-dashboard.json` can be imported directly.
 
 ---
 
@@ -598,11 +744,26 @@ Three ways to access the shortcuts reference:
 
 | Function | Auth required | Description |
 |----------|--------------|-------------|
-| `subscribe(subscriber, merchant, token, amount, interval)` | subscriber | Create or update subscription. Amount must be > 0, interval in [86400, 31536000] seconds. |
-| `execute_payment(subscriber, merchant)` | merchant | Collect payment if interval has elapsed. Transfers tokens directly subscriber → merchant. |
-| `cancel(subscriber, merchant)` | subscriber | Remove subscription from persistent storage. |
+| `subscribe(subscriber, merchant, token, amount, interval, strict, grace_period)` | subscriber | Create or update subscription. Amount ∈ (0, 10¹⁸], interval ∈ [86400, 31536000] seconds. |
+| `execute_payment(subscriber, merchant, token)` | merchant | Collect payment if interval has elapsed. Transfers tokens directly subscriber → merchant (after protocol fee split if configured). |
+| `cancel(subscriber, merchant, token)` | subscriber | Remove subscription from persistent storage. Revoke SEP-41 allowance to block future collections. |
+| `update_subscription(subscriber, merchant, new_amount, new_interval)` | subscriber | Modify amount and/or interval in-place. Preserves `next_payment` — no billing-cycle reset. |
+| `transfer_subscription(subscriber, old_merchant, new_merchant)` | subscriber + old_merchant | Atomically reassign subscription to a new merchant. Both parties must authorize. |
+| `batch_execute_payment(merchant, token, subscribers)` | merchant | Collect payments from up to 50 subscribers in one transaction. Fee split applied per subscriber. |
+| `get_subscription(subscriber, merchant, token)` | *(none — read-only)* | Return `Some(SubscriptionData)` if an active subscription exists, or `None` if it does not. |
+| `get_subscription_count(merchant)` | *(none — read-only)* | Return the number of active subscriptions indexed for a given merchant. Returns `0` if none. |
 
-### Examples
+### Parameter value ranges
+
+| Parameter | Type | Valid range | Description |
+|-----------|------|-------------|-------------|
+| `amount` | i128 | (0, 10¹⁸] | Payment per interval in token's smallest unit (stroops). Must be strictly positive and ≤ 1,000,000,000,000,000,000. |
+| `interval` | u64 | [86400, 31536000] | Seconds between payments. Minimum 1 day (86400 s), maximum 365 days (31536000 s). |
+| `fee_bps` | u32 | [0, 500] | Protocol fee in basis points. 0 = no fee, 500 = 5% max. Set by admin via `set_protocol_fee`. |
+| `grace_period` | Option<u64> | [0, ∞) | Optional seconds after payment due date before subscription can expire. Default: 0 (no grace period). |
+| `strict` | bool | {true, false} | When true, rejects subscription if subscriber's SEP-41 allowance < amount. When false, issues a warning event. |
+
+### Core subscription examples
 
 **subscribe** — authorize 100 tokens every 30 days:
 
@@ -614,11 +775,14 @@ stellar contract invoke \
   --merchant   GXYZ...MERCHANT \
   --token      CABC...USDC \
   --amount     100 \
-  --interval   2592000
+  --interval   2592000 \
+  --strict     false \
+  --grace-period 0
 ```
 
 ```typescript
 import { Contract, nativeToScVal, Address } from "@stellar/stellar-sdk";
+
 const op = contract.call(
   "subscribe",
   new Address(subscriber).toScVal(),
@@ -626,18 +790,59 @@ const op = contract.call(
   new Address(tokenAddress).toScVal(),
   nativeToScVal(100n, { type: "i128" }),
   nativeToScVal(2592000n, { type: "u64" }),
+  nativeToScVal(false, { type: "bool" }),
+  nativeToScVal(null),  // no grace period
 );
 // Expected: subscription stored, `subscribe` event emitted, first payment collectable immediately.
+// Error cases:
+//   - AmountMustBePositive (code 1) if amount ≤ 0
+//   - AmountTooLarge (code 9) if amount > 10^18
+//   - IntervalTooShort (code 2) if interval < 86400
+//   - IntervalTooLong (code 3) if interval > 31536000
+//   - SelfSubscription (code 10) if subscriber == merchant
+//   - InsufficientAllowance if strict=true and allowance < amount
 ```
 
-**execute_payment** — merchant collects a due payment:
+**subscribe with grace period** — allow up to 7 days late payment before expiry:
+
+```bash
+stellar contract invoke \
+  --id $CONTRACT_ID --source alice --network testnet \
+  -- subscribe \
+  --subscriber GABC...ALICE \
+  --merchant   GXYZ...MERCHANT \
+  --token      CABC...USDC \
+  --amount     5000 \
+  --interval   2592000 \
+  --strict     true \
+  --grace-period 604800
+```
+
+```typescript
+// grace_period = 604800 = 7 days in seconds
+// If payment fails, subscription enters overdue state.
+// After grace_period elapses, expire_subscription can be called to remove it.
+const op = contract.call(
+  "subscribe",
+  new Address(subscriber).toScVal(),
+  new Address(merchant).toScVal(),
+  new Address(tokenAddress).toScVal(),
+  nativeToScVal(5000n, { type: "i128" }),
+  nativeToScVal(2592000n, { type: "u64" }),
+  nativeToScVal(true, { type: "bool" }),
+  nativeToScVal(604800n, { type: "u64" }),  // 7 days grace period
+);
+```
+
+**execute_payment** — merchant collects a due payment (with protocol fee):
 
 ```bash
 stellar contract invoke \
   --id $CONTRACT_ID --source merchant-key --network testnet \
   -- execute_payment \
   --subscriber GABC...ALICE \
-  --merchant   GXYZ...MERCHANT
+  --merchant   GXYZ...MERCHANT \
+  --token      CABC...USDC
 ```
 
 ```typescript
@@ -645,8 +850,37 @@ const op = contract.call(
   "execute_payment",
   new Address(subscriber).toScVal(),
   new Address(merchant).toScVal(),
+  new Address(tokenAddress).toScVal(),
 );
-// Expected: 100 tokens transferred subscriber → merchant, `executed` event emitted, next_payment advanced.
+// Expected:
+//   - If protocol fee is 0%: 100 tokens → merchant
+//   - If protocol fee is 2.5% (250 bps):
+//       fee = 100 * 250 / 10_000 = 2 tokens
+//       merchant receives 98 tokens
+//       fee_collector receives 2 tokens
+//   - next_payment advanced by interval
+//   - `executed` event emitted with amount and payment_nonce
+//
+// Error cases:
+//   - NoActiveSubscription (code 4) if subscription not found
+//   - PaymentNotDue (code 5) if now < next_payment
+//   - TransferFailed (code 7) if subscriber balance < amount
+//   - SubscriptionPaused (code 12) if subscription is paused
+```
+
+**execute_payment — error case recovery:**
+
+```typescript
+// Scenario: subscriber has insufficient balance; payment fails
+const result = await server.simulateTransaction(tx);
+// Returns error: TransferFailed (code 7)
+// Subscription remains ACTIVE with overdue_since timestamp set
+// Merchant can retry execute_payment once subscriber adds balance
+// After grace_period expires, admin or anyone can call expire_subscription
+
+// If subscriber adds balance before grace period:
+const retryOp = contract.call("execute_payment", ...);
+// Second attempt succeeds, overdue_since is cleared, next_payment advanced
 ```
 
 **cancel** — subscriber terminates the agreement:
@@ -656,19 +890,310 @@ stellar contract invoke \
   --id $CONTRACT_ID --source alice --network testnet \
   -- cancel \
   --subscriber GABC...ALICE \
-  --merchant   GXYZ...MERCHANT
+  --merchant   GXYZ...MERCHANT \
+  --token      CABC...USDC
+
+# IMPORTANT: Also revoke the SEP-41 allowance to prevent future collections
+stellar contract invoke \
+  --id $TOKEN_CONTRACT_ID --source alice --network testnet \
+  -- approve \
+  --from GABC...ALICE \
+  --spender $CONTRACT_ID \
+  --amount 0
 ```
 
 ```typescript
+// Step 1: Remove subscription from contract
 const op = contract.call(
   "cancel",
   new Address(subscriber).toScVal(),
   new Address(merchant).toScVal(),
+  new Address(tokenAddress).toScVal(),
 );
-// Expected: subscription removed; future execute_payment calls return NoActiveSubscription (error 4).
+// Expected: subscription removed, `cancel` event emitted
+
+// Step 2: Revoke allowance for added security
+const tokenClient = new token.Client(env, tokenAddress);
+tokenClient.approve(subscriber, contractAddress, BigInt(0));
+// This is an additional layer of protection—even if the subscription
+// re-appears due to a bug, no tokens can be transferred without new approval.
+
+// Error case:
+//   - NoActiveSubscription (code 4) if subscription not found → idempotent, safe to retry
 ```
 
-For the full parameter reference and error cases see [docs/contract-api.md](docs/contract-api.md).
+**update_subscription** — modify terms without resetting billing cycle:
+
+```bash
+stellar contract invoke \
+  --id $CONTRACT_ID --source alice --network testnet \
+  -- update_subscription \
+  --subscriber GABC...ALICE \
+  --merchant   GXYZ...MERCHANT \
+  --new-amount 150 \
+  --new-interval 1209600
+```
+
+```typescript
+import {
+  Contract,
+  nativeToScVal,
+  Address,
+} from "@stellar/stellar-sdk";
+
+const op = contract.call(
+  "update_subscription",
+  new Address(subscriber).toScVal(),
+  new Address(merchant).toScVal(),
+  nativeToScVal(150n, { type: "i128" }),       // new amount
+  nativeToScVal(1209600n, { type: "u64" }),    // new interval (14 days)
+);
+// Expected:
+//   - Amount changed from 100 to 150
+//   - Interval changed from 30 days to 14 days
+//   - next_payment is PRESERVED — subscriber NOT charged immediately
+//   - `updated` event emitted with old and new values
+//   - TTL extended to ~365 days
+//
+// Typical use cases:
+//   - Subscriber upgrades plan: 100/mo → 150/mo
+//   - Subscriber downgrades plan: 100/mo → 50/mo
+//   - Annual to monthly billing: 1200/yr → 100/mo
+//
+// Error cases:
+//   - NoActiveSubscription (code 4) if subscription not found
+//   - AmountMustBePositive (code 1) if new_amount ≤ 0
+//   - AmountTooLarge (code 9) if new_amount > 10^18
+//   - IntervalTooShort (code 2) if new_interval < 86400
+//   - IntervalTooLong (code 3) if new_interval > 31536000
+```
+
+**batch_execute_payment** — collect from multiple subscribers in one call:
+
+```bash
+stellar contract invoke \
+  --id $CONTRACT_ID --source merchant-key --network testnet \
+  -- batch_execute_payment \
+  --merchant GXYZ...MERCHANT \
+  --token CABC...USDC \
+  --subscribers GABC...SUB1 GDEF...SUB2 GHIJ...SUB3
+```
+
+```typescript
+const op = contract.call(
+  "batch_execute_payment",
+  new Address(merchant).toScVal(),
+  new Address(tokenAddress).toScVal(),
+  new Vec(env, [
+    new Address("GABC...SUB1").toScVal(),
+    new Address("GDEF...SUB2").toScVal(),
+    new Address("GHIJ...SUB3").toScVal(),
+  ]),
+);
+// Expected return: Vec<(Address, bool)> = [
+//   (GABC...SUB1, true),   // payment successful
+//   (GDEF...SUB2, false),  // payment skipped: not due or insufficient balance
+//   (GHIJ...SUB3, true),   // payment successful
+// ]
+//
+// Cost benefits:
+//   - One auth check covers all subscribers
+//   - Fee split applied per subscriber
+//   - Protocol fee deducted from each payment
+//   - Reduced total transaction fee vs. 3 individual calls
+//
+// Constraints:
+//   - Maximum 50 subscribers per batch
+//   - Empty subscribers list returns EmptyBatch error
+//   - Batch is partial-success: failed subscribers do not block others
+//
+// Error cases:
+//   - EmptyBatch if subscribers.is_empty()
+//   - BatchTooLarge if subscribers.len() > 50
+```
+
+**transfer_subscription** — reassign subscription to new merchant (atomic):
+
+```bash
+stellar contract invoke \
+  --id $CONTRACT_ID --source alice --network testnet \
+  -- transfer_subscription \
+  --subscriber GABC...ALICE \
+  --old-merchant GXYZ...OLD_MERCHANT \
+  --new-merchant GNEW...NEW_MERCHANT
+```
+
+```typescript
+const op = contract.call(
+  "transfer_subscription",
+  new Address(subscriber).toScVal(),
+  new Address(oldMerchant).toScVal(),
+  new Address(newMerchant).toScVal(),
+);
+// Expected:
+//   - Subscription removed from old merchant's index
+//   - Subscription added to new merchant's index
+//   - All state preserved: token, amount, interval, next_payment
+//   - Atomic: either both changes commit or neither does
+//   - `subscription_transferred` event emitted
+//
+// Typical use cases:
+//   - Merchant key rotation: old_key → new_key
+//   - Business acquisition: subscriber's vendors merge
+//   - Account consolidation: old_merchant → admin account
+//
+// Authorization:
+//   - Both subscriber AND old_merchant must sign
+//   - Neither party alone can reassign the subscription
+//
+// Error cases:
+//   - NoActiveSubscription (code 4) if (subscriber, old_merchant) pair not found
+//   - SameMerchant if old_merchant == new_merchant (no-op)
+//   - SelfSubscription (code 10) if subscriber == new_merchant
+//   - SubscriptionAlreadyExists if (subscriber, new_merchant) pair already has active subscription
+```
+
+**get_subscription** — read active subscription state without auth:
+
+```bash
+stellar contract invoke \
+  --id $CONTRACT_ID --network testnet \
+  -- get_subscription \
+  --subscriber GABC...ALICE \
+  --merchant   GXYZ...MERCHANT \
+  --token      CABC...USDC
+```
+
+```typescript
+import {
+  Contract,
+  SorobanRpc,
+  TransactionBuilder,
+  Networks,
+  Address,
+  scValToNative,
+} from "@stellar/stellar-sdk";
+
+const server = new SorobanRpc.Server("https://soroban-testnet.stellar.org");
+const contract = new Contract(CONTRACT_ID);
+
+// Build a read-only simulation — no signing required.
+const account = await server.getAccount(anyPublicKey);
+const tx = new TransactionBuilder(account, { fee: "100", networkPassphrase: Networks.TESTNET })
+  .addOperation(
+    contract.call(
+      "get_subscription",
+      new Address(subscriber).toScVal(),
+      new Address(merchant).toScVal(),
+      new Address(tokenAddress).toScVal(),
+    )
+  )
+  .setTimeout(30)
+  .build();
+
+const sim = await server.simulateTransaction(tx);
+
+if (SorobanRpc.Api.isSimulationSuccess(sim) && sim.result) {
+  const raw = scValToNative(sim.result.retval);
+
+  if (raw === null) {
+    console.log("No active subscription for this pair.");
+  } else {
+    // raw is an object matching SubscriptionData:
+    // {
+    //   token: Address,
+    //   amount: i128,
+    //   interval: u64,
+    //   next_payment: u64,
+    //   is_paused: boolean,
+    //   grace_period: u64,
+    //   overdue_since: Option<u64>,
+    //   payment_nonce: u32,
+    // }
+    console.log("Subscription:", raw);
+    console.log("Amount (stroops):", raw.amount);
+    console.log("Interval (seconds):", raw.interval);
+    console.log("Next payment:", new Date(Number(raw.next_payment) * 1000));
+    console.log("Overdue since:", raw.overdue_since ? new Date(Number(raw.overdue_since) * 1000) : "N/A");
+    console.log("Is paused:", raw.is_paused);
+  }
+}
+// Expected: returns the SubscriptionData struct or null (None) if no subscription exists.
+// No wallet connection or signature needed — safe to call from any read-only context.
+```
+
+**get_subscription_count** — enumerate active subscriptions for a merchant:
+
+```bash
+stellar contract invoke \
+  --id $CONTRACT_ID --network testnet \
+  -- get_subscription_count \
+  --merchant GXYZ...MERCHANT
+```
+
+```typescript
+const tx = new TransactionBuilder(account, { fee: "100", networkPassphrase: Networks.TESTNET })
+  .addOperation(
+    contract.call(
+      "get_subscription_count",
+      new Address(merchantAddress).toScVal(),
+    )
+  )
+  .setTimeout(30)
+  .build();
+
+const sim = await server.simulateTransaction(tx);
+
+if (SorobanRpc.Api.isSimulationSuccess(sim) && sim.result) {
+  const count = scValToNative(sim.result.retval) as number;
+  console.log(`Merchant has ${count} active subscriber(s).`);
+}
+// Expected: u32 count of active subscriptions indexed for the merchant.
+// Returns 0 when the merchant has no subscribers or the index has expired from temporary storage.
+```
+
+### Protocol fee split mechanics
+
+When a protocol fee is configured via `set_protocol_fee(admin, fee_bps, fee_collector)`, every `execute_payment` call splits the payment:
+
+```
+fee_bps = 250 (2.5%)
+amount = 100 tokens
+
+fee             = amount × fee_bps / 10_000 = 100 × 250 / 10_000 = 2 tokens (integer division)
+merchant_amount = amount - fee = 100 - 2 = 98 tokens
+
+Transfer 1: subscriber → merchant        for 98 tokens
+Transfer 2: subscriber → fee_collector   for 2 tokens
+```
+
+**Key points:**
+- Fee is capped at 500 bps (5%) — admin cannot extract more than 5% per transaction.
+- Fee rounds down; amounts < 200 tokens at 50 bps yield zero fee.
+- Each transfer triggers a `fee_collected` event.
+- Subscriber's SEP-41 allowance must cover the full `amount`; the contract handles the split internally.
+- `batch_execute_payment` applies the same fee split per subscriber.
+
+### Summary table: common error scenarios
+
+| Error Code | Name | Trigger | Recovery |
+|---|---|---|---|
+| 1 | `AmountMustBePositive` | `amount ≤ 0` in `subscribe` or `update_subscription` | Correct amount to be > 0 and resubmit |
+| 2 | `IntervalTooShort` | `interval < 86400` (< 1 day) | Set interval ≥ 86400 seconds |
+| 3 | `IntervalTooLong` | `interval > 31536000` (> 365 days) | Set interval ≤ 31536000 seconds |
+| 4 | `NoActiveSubscription` | Attempting payment/query on non-existent pair | Call `subscribe` to create; or check pair is correct |
+| 5 | `PaymentNotDue` | `execute_payment` called before `now ≥ next_payment` | Wait until `next_payment` or check timestamp |
+| 6 | `Unauthorized` | Invalid or missing signature on restricted entry point | Ensure correct account signs via Freighter or CLI |
+| 7 | `TransferFailed` | Subscriber has insufficient balance for payment | Subscriber must deposit tokens and retry; or `cancel` |
+| 9 | `AmountTooLarge` | `amount > 10^18` | Reduce amount ≤ 1,000,000,000,000,000,000 |
+| 10 | `SelfSubscription` | `subscriber == merchant` in `subscribe` | Use different addresses for subscriber and merchant |
+| 12 | `SubscriptionPaused` | `execute_payment` on paused subscription before resume time | Wait until pause expires or cancel |
+| 19 | `AmountExceedsLimit` | `amount` exceeds the admin-configured cap in `subscribe` | Lower the amount or have the admin raise the cap |
+| 20 | `SameMerchant` | `old_merchant == new_merchant` in `transfer_subscription` | Choose a distinct destination merchant |
+| 21 | `SubscriptionAlreadyExists` | Destination `(subscriber, new_merchant)` pair already has a subscription | Cancel the existing subscription or choose another merchant |
+| 24 | `SubscriptionNotPaused` | `resume_subscription` called on an active subscription | No action needed, or pause it first |
+
+For the full parameter reference and additional administrative functions see [docs/contract-api.md](docs/contract-api.md).
 
 ### Events emitted
 
@@ -678,8 +1203,12 @@ For the full parameter reference and error cases see [docs/contract-api.md](docs
 | `executed` | `(symbol("executed"), subscriber, merchant, token)` | `amount: i128` | Successful transfer |
 | `payment_transfer_failure` | `(symbol("payment_transfer_failure"), subscriber, merchant)` | `amount: i128` | Insufficient balance detected before transfer |
 | `cancel` | `(symbol("cancel"), subscriber, merchant)` | `()` | Always on success |
+| `payment_transfer_success` | `(symbol("payment_transfer_success"), subscriber, merchant)` | `amount: i128` | Successful transfer (batch telemetry) |
+| `batch_execute_initiated` | `(symbol("batch_execute_initiated"), merchant)` | `batch_size: i128` | Start of `batch_execute_payment` |
+| `contract_migrated` | `(symbol("contract_migrated"), admin)` | `new_version: i128` | Schema migration completed |
+| `low_allowance` | `(symbol("low_allowance"), subscriber, merchant, token)` | `(allowance: i128, required: i128)` | Subscriber allowance below amount (non-fatal warning) |
 
-Events use a `Symbol` discriminant as the first topic. The data field is an `i128` amount in stroops (or `()` for `cancel`).
+Events use a `Symbol` discriminant as the first topic. The data field is an `i128` amount in stroops, a tuple `(i128, i128)` for `low_allowance`, or `()` for `cancel`.
 
 **Quick decode example (TypeScript):**
 
@@ -699,67 +1228,276 @@ See [docs/events.md](docs/events.md) for the full event reference, RPC query exa
 
 ---
 
+## Contract interface stability and upgrade policy
+
+> **Current contract version:** `1.0.0`  
+> **Schema version:** `1`  
+> **Entry point:** `get_version()` → `"1.0.0"` | `get_schema_version()` → `1`
+
+Soroban contracts are **immutable once deployed**. A contract address is forever bound to the WASM bytecode uploaded at deployment time. "Upgrading" the contract always means deploying a new contract address and migrating clients to it — there is no in-place code replacement.
+
+### What is stable in v1.x.x
+
+The following are guaranteed stable across all `v1.x.x` releases:
+
+| Surface | Stability guarantee |
+|---------|-------------------|
+| Entry point names (`subscribe`, `execute_payment`, `cancel`, `batch_execute_payment`, `get_subscription`) | **Stable** — never removed or renamed in v1 |
+| Parameter order for all entry points | **Stable** — positional args will not shift |
+| Parameter types for all entry points | **Stable** — `Address`, `i128`, `u64`, `bool` types are locked |
+| Error code numbers (1–25) | **Stable** — codes will not be reassigned |
+| Event topic structure (`subscribe`, `executed`, `cancel`, `payment_transfer_failure`) | **Stable** — topic 0 discriminant and topic order are locked |
+| `SubscriptionData` field names returned by `get_subscription` | **Stable** — fields may be added but never removed |
+| SEP-41 token interface assumptions | **Stable** — `balance`, `transfer`, `allowance` signatures are fixed |
+
+### What may change in minor versions (v1.1.x, v1.2.x, …)
+
+A **minor bump** (e.g. `1.0.0 → 1.1.0`) signals additive, backwards-compatible changes:
+
+- **New entry points** — additional functions on the same contract.
+- **New optional parameters** — added at the end of an existing entry point's parameter list. Existing callers that pass positional arguments to the functions up to the current last parameter are unaffected.
+- **New event types** — off-chain indexers must ignore unknown event topics gracefully.
+- **New error codes** — higher-numbered codes may be added; existing codes 1–25 remain.
+- **New `SubscriptionData` fields** — the struct may gain new fields; off-chain code must not assume a fixed field count.
+
+**Minimum required change for existing clients after a minor bump:** none. Existing transactions continue to work without modification.
+
+### What triggers a major version (v2.0.0)
+
+A **major bump** (`1.x.x → 2.0.0`) means a breaking change. Examples that would force a major bump:
+
+- Removing or renaming an entry point.
+- Changing the type of an existing parameter.
+- Reordering parameters of an existing entry point.
+- Removing or reassigning an error code.
+- Changing the topic structure of an existing event.
+- Changing the storage key scheme in a way that invalidates existing persistent entries.
+
+Major versions always require:
+1. Deploying a new contract address.
+2. Running the migration path described in [docs/versioning.md](docs/versioning.md).
+3. Coordinating client upgrades (frontend, backend, off-chain indexers).
+
+### How to add a new entry point without breaking existing clients
+
+Follow this checklist when extending the contract interface:
+
+1. **Add new entry point at the bottom** of `#[contractimpl] impl SubscriptionProtocol`. Never reorder existing functions (the XDR ABI is position-independent but reordering is a footgun for tooling).
+2. **Use a new, distinct function name.** Never overload an existing entry point.
+3. **Append new parameters after all existing ones** if extending an existing function signature. Never insert parameters in the middle — that shifts positional offsets for every existing caller.
+4. **Register new error codes with unused numbers** (currently ≥ 26). Never reuse a retired code.
+5. **Emit new events with a new `Symbol` topic discriminant.** Off-chain consumers that filter for known topics will silently ignore unknown events — this is safe.
+6. **Increment `CONTRACT_VERSION`** in `contracts/subscription/src/storage.rs`:
+   - New entry point → bump minor: `"1.0.0"` → `"1.1.0"`.
+   - New fields on `SubscriptionData` → bump minor and increment `CURRENT_SCHEMA_VERSION`.
+   - Breaking change → bump major: `"1.x.x"` → `"2.0.0"`.
+7. **Update `docs/contract-api.md`** with the new entry point's full parameter table, error cases, and CLI/TypeScript examples.
+8. **Update `CHANGELOG.md`** under the `[Unreleased]` heading.
+
+### How to add a new field to `SubscriptionData`
+
+`SubscriptionData` is stored as XDR on the ledger. Because Soroban serializes `#[contracttype]` structs by **field order**, append-only additions are safe on a fresh deployment but would silently corrupt reads from existing entries on an upgraded contract. The safe procedure is:
+
+1. **Only add fields at the end** of the struct definition in `storage.rs`.
+2. **Increment `CURRENT_SCHEMA_VERSION`** (currently `1` → `2`).
+3. **Provide a `migrate(admin)` migration path** that reads existing entries under the old schema and rewrites them with default values for the new field, if entries must survive across deployments.
+4. For a **fresh deployment** (new contract address, no existing state), no migration is needed — all entries will be created with the full new struct from day one.
+
+### Frontend and off-chain client compatibility
+
+The frontend (`frontend/src/lib/transaction_builder.ts`) calls `subscribe` with five positional ScVal arguments. When the contract interface changes:
+
+| Change type | Frontend impact | Required action |
+|-------------|----------------|----------------|
+| New entry point added | None | No frontend change needed unless the new feature is surfaced in UI |
+| New optional parameter appended to `subscribe` | None — existing five-arg call still valid | Pass new arg only when the UI exposes it |
+| Parameter type change | **Breaking** — ScVal encoding must be updated | Bump major version; update `buildAndSubmitSubscribe` |
+| Parameter removed | **Breaking** | Bump major version; remove from builder |
+| New event type emitted | None for transaction builder | Backend indexer must handle unknown event topics |
+
+To verify client–contract compatibility at runtime, call the read-only version helpers before submitting a transaction:
+
+```typescript
+import { Contract, SorobanRpc } from "@stellar/stellar-sdk";
+
+const server = new SorobanRpc.Server(rpcUrl);
+const contract = new Contract(contractId);
+
+// Read version string from on-chain entry point
+const versionResult = await server.simulateTransaction(
+  buildVersionQueryTx(contract, account, networkPassphrase)
+);
+// Expected: "1.0.0"
+const version = scValToNative(versionResult.result?.retval);
+const [major] = String(version).split(".").map(Number);
+if (major !== 1) {
+  throw new Error(`Unsupported contract version: ${version}. This client requires v1.x.x.`);
+}
+```
+
+See [docs/versioning.md](docs/versioning.md) for the full migration guide, including how to run `migrate(admin)` after deploying a schema-version bump.
+
+---
+
 ## Transaction fees and execution budgets
 
-Soroban charges fees based on **CPU instructions**, **memory bytes**, and **ledger entry reads/writes**. All three entry points are computationally O(1) — they touch a fixed number of storage entries and make no loops — but they differ meaningfully in cost because `execute_payment` crosses into an external token contract.
+Soroban charges fees based on **CPU instructions**, **memory bytes**, and **ledger entry reads/writes**. All entry points are O(1) — they touch a fixed number of storage entries and make no loops — but they differ meaningfully in cost based on the number of cross-contract calls they make.
+
+The values in the table below are baseline measurements from `simulateTransaction` on testnet. They are stored in [`docs/performance-baseline.json`](docs/performance-baseline.json) and enforced by CI: a **warning** is emitted if any metric grows by more than **+20%**, and CI **fails** if any metric grows by more than **+25%** compared to the baseline.
+
+### Measured resource budgets (all 8 entry points)
+
+| Entry Point | Instructions | Read Bytes | Write Bytes | Min Fee (stroops) | Recommended `instructions` budget |
+|-------------|-------------|------------|-------------|-------------------|-----------------------------------|
+| `subscribe` | ~280,000 | ~300 | ~450 | ~1,800 | **350,000** |
+| `execute_payment` | ~650,000 | ~500 | ~600 | ~6,500 | **815,000** |
+| `cancel` | ~180,000 | ~250 | ~200 | ~1,200 | **225,000** |
+| `update_subscription` | ~190,000 | ~280 | ~350 | ~1,400 | **240,000** |
+| `pause_subscription` | ~160,000 | ~260 | ~320 | ~1,200 | **200,000** |
+| `resume_subscription` | ~170,000 | ~260 | ~320 | ~1,250 | **215,000** |
+| `batch_execute_payment` (per subscriber) | ~450,000 | ~350 | ~400 | ~4,500 | **560,000** × N |
+| `transfer_subscription` | ~320,000 | ~400 | ~500 | ~2,500 | **400,000** |
+
+Recommended budget = measured baseline × 1.25 (25% safety buffer). Always run `simulateTransaction` before broadcasting — actual values vary slightly based on host version and storage state.
 
 ### Cost breakdown per entry point
 
-#### `subscribe` — moderate cost
+#### `subscribe` — moderate cost (~280,000 instructions)
 
 Operations performed:
 - 1 `require_auth` on `subscriber`
-- 5 input validations (amount bounds, interval bounds, timestamp guard)
-- 1 persistent storage write (`SubscriptionData` struct, ~5 fields)
-- 1 TTL extension (`extend_ttl` on the same entry)
+- 6 input validations (self-subscription check, amount bounds, interval bounds, timestamp guard, allowance check)
+- 1 cross-contract `allowance` call (SEP-41 token) — to emit low-allowance warning in non-strict mode
+- 1 persistent storage write (`SubscriptionData` struct, ~9 fields)
+- 2 persistent index writes (merchant subscription index + subscriber roster)
+- 1 TTL extension
 - 1 event publish (`subscribe`, 4 topics + i128 data)
 
-This is a pure write with no cross-contract calls. Expect roughly **50,000–150,000 CPU instructions** under normal conditions. The dominant cost is the auth verification and the persistent storage write (ledger entry write fee).
-
 **Budget guidance:**
-- Inclusion fee: standard (100 stroops is usually sufficient on testnet; 1,000–10,000 stroops on mainnet during normal congestion)
-- Resource fee: set `instructions` to at least **150,000** and `write_bytes` to at least **300**
-- The Stellar CLI and SDKs can simulate the transaction first (`simulateTransaction`) to get exact values
+- Resource fee: set `instructions` to at least **350,000** and `write_bytes` to at least **565**
+- The allowance cross-contract call adds ~50,000 instructions compared to the original 3-field implementation
 
-#### `execute_payment` — highest cost
+#### `execute_payment` — highest cost (~650,000 instructions)
 
 Operations performed:
 - 1 `require_auth` on `merchant`
-- 1 persistent storage read
+- 1 persistent storage read + duplicate execution marker check (temporary storage)
 - 1 ledger timestamp read
-- 1 cross-contract `balance` call on the SEP-41 token contract
-- 1 cross-contract `transfer` call on the SEP-41 token contract (the most expensive operation)
-- 1 persistent storage write (updated `next_payment`)
+- 1 cross-contract `allowance` call (SEP-41 token)
+- 1 cross-contract `balance` call (SEP-41 token)
+- 1 cross-contract `transfer` call (SEP-41 token) — most expensive; performs auth, balance reads, and two writes inside the token contract
+- 1 persistent storage write (updated `next_payment` + nonce + overdue_since cleared)
+- 1 execution marker write (temporary storage)
 - 1 TTL extension
-- 1 event publish (`executed` or `payment_transfer_failure`, depending on outcome)
+- 1 event publish (`executed`)
 
-The two cross-contract calls — especially `transfer`, which itself performs auth checks, balance reads, and two storage writes inside the token contract — are what make this the most expensive entry point. Soroban charges for every instruction executed within invoked contracts, not just the top-level caller.
+The three cross-contract calls dominate. Soroban charges for every instruction executed within invoked contracts, not just the top-level caller.
 
 **Budget guidance:**
-- Resource fee: set `instructions` to at least **500,000** and `write_bytes` to at least **500**
-- Always run `simulateTransaction` before broadcasting — the simulation returns exact `instructions`, `readBytes`, and `writeBytes` values
-- If the subscriber has insufficient balance, the contract returns `TransferFailed` early (after the `balance` read but before `transfer`) and emits `payment_transfer_failure`. This path is slightly cheaper than a successful transfer since the token's `transfer` is never invoked
+- Resource fee: set `instructions` to at least **815,000** and `write_bytes` to at least **750**
+- The `TransferFailed` path (~390,000 instructions) is ~40% cheaper than success since `transfer` is never invoked
+- The `PaymentNotDue` path (~65,000 instructions) is ~90% cheaper — only auth + storage read
 
-#### `cancel` — lowest cost
+#### `cancel` — low cost (~180,000 instructions)
 
 Operations performed:
 - 1 `require_auth` on `subscriber`
-- 1 persistent storage `has` check (read)
+- 1 persistent storage `has` check
 - 1 persistent storage `remove`
+- 1 merchant subscription index update (remove hash)
+- 1 subscriber roster update (remove address)
 - 1 event publish (`cancel`, 2 topics + unit data)
 
-No cross-contract calls, no writes to new keys. Removing a persistent entry reduces ledger size, which may earn a small rent refund. This is the cheapest of the three entry points.
+No cross-contract calls. Removing a persistent entry reduces ledger size.
 
 **Budget guidance:**
-- Resource fee: set `instructions` to at least **50,000** and `write_bytes` to at least **100**
-- In practice the `simulateTransaction` result will likely be even lower
+- Resource fee: set `instructions` to at least **225,000** and `write_bytes` to at least **250**
+
+#### `update_subscription` — low-moderate cost (~190,000 instructions)
+
+Operations performed:
+- 1 `require_auth` on `subscriber`
+- 1 persistent storage read
+- 4 validations (amount + interval bounds)
+- 1 persistent storage write (updates amount + interval; `next_payment` deliberately preserved)
+- 1 TTL extension
+- 1 event publish (`updated`, 6 topics)
+
+No cross-contract calls. Similar cost to `subscribe` minus the index writes and token call.
+
+**Budget guidance:**
+- Resource fee: set `instructions` to at least **240,000** and `write_bytes` to at least **440**
+
+#### `pause_subscription` — low cost (~160,000 instructions)
+
+Operations performed:
+- 1 `require_auth` on `subscriber`
+- 1 persistent storage read
+- 1 optional ledger timestamp read (only when `resume_at` is provided)
+- 1 persistent storage write (sets `is_paused = true`, stores optional `paused_until`)
+- 1 TTL extension
+- 1 event publish (`paused`)
+
+**Budget guidance:**
+- Resource fee: set `instructions` to at least **200,000** and `write_bytes` to at least **400**
+
+#### `resume_subscription` — low cost (~170,000 instructions)
+
+Operations performed:
+- 1 `require_auth` on `subscriber`
+- 1 persistent storage read
+- 1 ledger timestamp read (to recompute `next_payment` from current time)
+- 1 persistent storage write (clears `is_paused`, clears `paused_until`, updates `next_payment`)
+- 1 TTL extension
+- 1 event publish (`resumed`)
+
+Slightly more expensive than `pause_subscription` because `next_payment` is always recomputed.
+
+**Budget guidance:**
+- Resource fee: set `instructions` to at least **215,000** and `write_bytes` to at least **400**
+
+#### `batch_execute_payment` — scales with batch size (~450,000 instructions per subscriber)
+
+Operations performed per subscriber in the batch:
+- 1 persistent storage read
+- 1 cross-contract `allowance` call
+- 1 cross-contract `balance` call
+- 1 cross-contract `transfer` call (on success)
+- 1 persistent storage write + TTL extend
+- 1 execution marker write
+- 2 event publishes
+
+Batch size is capped at **50 subscribers** (`BATCH_MAX_SIZE`). Failed subscribers (no subscription, not due, insufficient balance) are skipped gracefully without aborting the batch.
+
+**Budget guidance for N subscribers:**
+- `instructions`: at least **560,000 × N**
+- `write_bytes`: at least **500 × N**
+
+#### `transfer_subscription` — moderate cost (~320,000 instructions)
+
+Operations performed:
+- 2 `require_auth` calls (subscriber + old_merchant)
+- 1 persistent storage read (old subscription key)
+- 1 existence check (new key must not already exist)
+- 1 persistent storage write (new subscription key)
+- 1 persistent storage remove (old subscription key)
+- 2 merchant subscription index updates (remove from old merchant, add to new)
+- 2 subscriber roster updates (remove from old merchant, add to new)
+- 1 TTL extension
+- 1 event publish (`subscription_transferred`)
+
+**Budget guidance:**
+- Resource fee: set `instructions` to at least **400,000** and `write_bytes` to at least **625**
 
 ### Relative cost ranking
 
 ```
-execute_payment  >  subscribe  >  cancel
-(cross-contract       (write +       (read +
- transfer)             TTL extend)    remove)
+batch_execute_payment  >  execute_payment  >  transfer_subscription  >  subscribe
+(N × token transfers)     (3 cross-contract    (2 auths + 4 index       (1 allowance call +
+                           calls)               writes)                  3 storage writes)
+
+   update_subscription  ≈  resume_subscription  ≈  pause_subscription  >  cancel
+       (~190k instr)           (~170k instr)          (~160k instr)        (~180k instr)
 ```
 
 ### How to get exact fee estimates
@@ -774,10 +1512,12 @@ stellar contract invoke \
   --simulate-only \
   -- subscribe \
   --subscriber <SUBSCRIBER_ADDRESS> \
-  --merchant  <MERCHANT_ADDRESS> \
-  --token     <TOKEN_ADDRESS> \
-  --amount    1000000 \
-  --interval  86400
+  --merchant   <MERCHANT_ADDRESS> \
+  --token      <TOKEN_ADDRESS> \
+  --amount     1000000 \
+  --interval   86400 \
+  --strict     false \
+  --grace-period null
 ```
 
 Or via the JavaScript SDK:
@@ -797,27 +1537,45 @@ if (SorobanRpc.Api.isSimulationSuccess(simResult)) {
 }
 ```
 
-The `minResourceFee` from simulation is the floor. Add a 10–25% buffer on `instructions` for safety — network-level variance (e.g., host version upgrades) can shift costs slightly between simulation and submission.
+The `minResourceFee` from simulation is the floor. Add a **25% buffer** on `instructions` for safety — network-level variance (e.g., host version upgrades) can shift costs slightly between simulation and submission.
 
 ### Ledger entry rent and TTL
 
-`subscribe` and `execute_payment` both call `extend_ttl` to keep the subscription entry alive:
+`subscribe`, `execute_payment`, `update_subscription`, `resume_subscription`, `pause_subscription`, and `transfer_subscription` all call `extend_ttl` to keep the subscription entry alive:
 
 - Minimum TTL: ~30 days (518,400 ledgers at 5 s/ledger)
 - Maximum TTL: ~365 days (6,307,200 ledgers)
 
-The TTL extension adds a **rent fee** proportional to the number of ledgers being extended and the size of the entry. For most subscriptions the entry is small (~200 bytes), so rent is a minor fraction of the total fee. If a subscription entry expires (TTL reaches zero) before `cancel` is called, it will be evicted from the ledger; a new `subscribe` call will recreate it.
+The TTL extension adds a **rent fee** proportional to the number of ledgers extended and the entry size. For most subscriptions the entry is small (~300 bytes), so rent is a minor fraction of the total fee. If a subscription entry expires (TTL reaches zero) before `cancel` is called, it is evicted from the ledger; a new `subscribe` call will recreate it.
 
 ### Fee behavior on failure
 
-Failed calls that return a `ContractError` (e.g., `PaymentNotDue`, `NoActiveSubscription`, `TransferFailed`) **still consume fees** for the work performed up to the point of the error. The transaction is included in the ledger as a failed invocation. Budget accordingly:
+Failed calls that return a `ContractError` **still consume fees** for the work performed up to the point of the error.
 
 | Scenario | Fee relative to success |
 |----------|------------------------|
-| `execute_payment` → `PaymentNotDue` | ~10–20% of full cost (only auth + storage read before early return) |
-| `execute_payment` → `TransferFailed` | ~60–80% of full cost (balance cross-contract call completed, transfer skipped) |
+| `execute_payment` → `PaymentNotDue` | ~10% of full cost (auth + storage read + early return) |
+| `execute_payment` → `TransferFailed` | ~60% of full cost (allowance + balance calls completed, transfer skipped) |
 | `subscribe` → validation error | ~10–15% of full cost (auth + validation only, no write) |
-| `cancel` → `NoActiveSubscription` | ~10% of full cost (auth + storage has check only) |
+| `cancel` → `NoActiveSubscription` | ~15% of full cost (auth + storage has check only) |
+| `pause_subscription` → `SubscriptionPaused` | ~25% of full cost (auth + storage read) |
+| `resume_subscription` → `SubscriptionNotPaused` | ~25% of full cost (auth + storage read) |
+| `batch_execute_payment` — skipped subscriber | ~20% per-subscriber cost (storage read + check only) |
+
+### CI regression enforcement
+
+Benchmark results are stored in [`docs/performance-baseline.json`](docs/performance-baseline.json). The `benchmark` job in `.github/workflows/ci.yml` runs on every contract change and compares current simulation results against the baseline:
+
+- **+20% increase** on any metric → `::warning::` annotation in CI (build continues)
+- **+25% increase** on any metric → CI step **fails** (must be fixed or baseline updated with justification)
+
+To update the baseline after an intentional performance change, run:
+
+```bash
+CONTRACT_ID=<deployed-contract-id> bash scripts/benchmark.sh --skip-deploy
+```
+
+and commit the updated `docs/performance-baseline.json`.
 
 ---
 
@@ -833,20 +1591,38 @@ Failed calls that return a `ContractError` (e.g., `PaymentNotDue`, `NoActiveSubs
 | 6 | `Unauthorized` | Authorization check failed |
 | 7 | `TransferFailed` | Insufficient subscriber balance at payment time |
 | 8 | `InvalidTimestamp` | Ledger timestamp is zero or would overflow |
-| 9 | `AmountTooLarge` | `amount > 10¹⁸` in `subscribe` |
-| 10 | `SelfSubscription` | `subscriber == merchant` in `subscribe` |
+| 9 | `AmountTooLarge` | `amount > 10¹⁸` in `subscribe` / `update_subscription`, or invalid `set_max_amount` cap |
+| 10 | `SelfSubscription` | `subscriber == merchant` in `subscribe` or `transfer_subscription` |
 | 11 | `InvalidTokenAddress` | `token` is the contract's own address in `subscribe` |
+| 12 | `SubscriptionPaused` | Payment attempted while a subscription is paused before `paused_until`, or double pause |
+| 13 | `EmptyBatch` | `subscribers` list is empty in `batch_execute_payment` |
+| 14 | `BatchTooLarge` | `subscribers.len() > 50` in `batch_execute_payment` |
+| 15 | `InsufficientAllowance` | `strict == true` and `allowance < amount` in `subscribe`, or allowance revoked before `execute_payment` |
+| 16 | `AlreadyMigrated` | Schema already at current version in `migrate` |
+| 17 | `NotAdmin` | Caller is not the stored admin in `migrate`, `set_max_amount`, or `set_protocol_fee` |
+| 18 | `NotInitialized` | `initialize` was never called |
+| 19 | `AmountExceedsLimit` | `amount` exceeds the admin-configured `max_amount` in `subscribe` |
+| 20 | `SameMerchant` | `old_merchant == new_merchant` in `transfer_subscription` |
+| 21 | `SubscriptionAlreadyExists` | Destination `(subscriber, new_merchant)` pair already has a subscription |
+| 22 | `DuplicateExecution` | Replay guard detected an already-executed payment nonce |
+| 23 | `GracePeriodActive` | Grace-period-dependent operation attempted while grace is still active |
+| 24 | `SubscriptionNotPaused` | `resume_subscription` called on an active subscription |
+| 25 | `FeeBpsTooHigh` | `fee_bps > 500` in `set_protocol_fee` |
 
 ---
 
 ## Event Indexing Architecture
 
-SorobanPay emits structured events via Soroban RPC for off-chain indexing. The contract publishes four event types:
+SorobanPay emits structured events via Soroban RPC for off-chain indexing. The contract publishes eight event types:
 
 - **`subscribe`** — Emitted when a subscription is created or updated. Signals the start of a recurring payment relationship.
 - **`executed`** — Emitted after a successful payment transfer and timestamp advance. Confirms payment collection.
 - **`payment_transfer_failure`** — Emitted when a payment attempt fails due to insufficient subscriber balance. The subscription remains active and is eligible for retry.
 - **`cancel`** — Emitted after a subscription is successfully removed. Provides an explicit, reliable signal for off-chain indexers to mark the relationship as ended.
+- **`payment_transfer_success`** — Emitted after each successful transfer in a batch. Provides telemetry for backend reconciliation.
+- **`batch_execute_initiated`** — Emitted at the start of `batch_execute_payment` with the batch size. Useful for tracking batch processing.
+- **`contract_migrated`** — Emitted when a schema migration completes. Signals off-chain systems to update their schema expectations.
+- **`low_allowance`** — Emitted as a non-fatal warning when the subscriber's token allowance is below the subscription amount (non-strict mode). Can be used to prompt the subscriber to approve a larger allowance.
 
 ### Key Components
 
@@ -860,8 +1636,8 @@ SorobanPay emits structured events via Soroban RPC for off-chain indexing. The c
 ### Event Schema
 
 Each event contains:
-- **Topics:** `(symbol, subscriber_address, merchant_address[, token_address])` — enables filtering by party or event type
-- **Data:** `amount: i128` (or `()` for `cancel`) — payment amount in token's smallest unit
+- **Topics:** `(symbol, subscriber_address, merchant_address[, token_address])` — enables filtering by party or event type. `batch_execute_initiated` has only `(symbol, merchant)` and `contract_migrated` has only `(symbol, admin)`.
+- **Data:** `amount: i128` for most events, `(allowance: i128, required: i128)` for `low_allowance`, `batch_size: i128` for `batch_execute_initiated`, `new_version: i128` for `contract_migrated`, or `()` for `cancel` — all amounts in token's smallest unit.
 
 ### Recommended Architecture
 
@@ -952,6 +1728,38 @@ Every entry point calls `require_auth()` as its first statement — before any s
 
 Subscribers grant a SEP-41 allowance to the contract address. The contract's `execute_payment` calls `token.transfer(subscriber, merchant, amount)` using that allowance. Revoking the allowance with `token.approve(contract_address, 0)` immediately prevents all future collections — regardless of whether the on-chain subscription record still exists. This gives subscribers a unilateral, no-contract-call emergency stop.
 
+### Protocol fee model
+
+SorobanPay supports an optional on-chain protocol fee configured by the contract admin via `set_protocol_fee(admin, fee_bps, fee_collector)`.
+
+**Fee split mechanics:**
+
+When `fee_bps > 0`, every `execute_payment` call splits the payment into two transfers:
+
+```
+fee             = amount * fee_bps / 10_000   (integer division — rounds down)
+merchant_amount = amount - fee
+
+transfer 1: subscriber → merchant        for merchant_amount
+transfer 2: subscriber → fee_collector   for fee
+```
+
+When `fee_bps = 0` (the default) only one transfer is made and behavior is identical to the no-fee baseline.
+
+**Constraints and abuse prevention:**
+
+| Constraint | Value |
+|-----------|-------|
+| Maximum `fee_bps` | `500` (5 %) |
+| `set_protocol_fee` requires | admin signature |
+| Fee config stored | instance storage (upgradeable by admin only) |
+
+The 500 bps cap prevents admin abuse: even a compromised admin key cannot extract more than 5 % of any payment. The subscriber's allowance model (see below) remains the unilateral emergency stop — revoking the SEP-41 allowance blocks all transfers regardless of fee configuration.
+
+**Integer division truncation:** fee rounds down toward zero. For example, 1 token at 50 bps yields fee = 0 (the merchant receives the full token). The first non-zero fee at 50 bps occurs at 200 tokens (`200 * 50 / 10_000 = 1`).
+
+**Events:** a `fee_collected` event is emitted after each successful fee transfer, with topics `(symbol("fee_collected"), subscriber, merchant, fee_collector)` and data `fee_amount: i128`.
+
 ### Time-lock enforcement
 
 `execute_payment` checks `now >= next_payment` using the Soroban ledger timestamp before attempting any transfer. The timestamp is set by network validators and cannot be manipulated by the transaction submitter. Merchants cannot collect payments early or double-collect within a billing window.
@@ -972,9 +1780,47 @@ For guidance on storing backend secrets safely (database credentials, RPC API ke
 
 ---
 
+## Documentation
+
+| Document | Description |
+|----------|-------------|
+| [docs/faq.md](docs/faq.md) | Frequently asked questions for integrators |
+| [docs/deployment.md](docs/deployment.md) | Production deployment guide (mainnet, Docker, Kubernetes, monitoring) |
+| [docs/saas-integration-guide.md](docs/saas-integration-guide.md) | End-to-end SaaS billing integration guide with Node.js examples |
+
+---
+
+## Use Cases
+
+- **SaaS billing** — See [docs/saas-integration-guide.md](docs/saas-integration-guide.md) for a complete walkthrough: contract deployment, event indexing, webhooks, plan changes, cancellations, and revenue reporting.
+- **Creator subscriptions** — Fans grant a one-time allowance; creators collect recurring payments on-chain without custodial wallets.
+- **Recurring donations** — DAOs and nonprofits accept on-chain pledges with configurable intervals (daily to annual).
+
+---
+
+## Frontend
+
+### Storybook (component documentation)
+
+```bash
+cd frontend
+npm run storybook
+```
+
+Opens Storybook at http://localhost:6006. Stories are available for all UI components including `SubscriptionForm`, `SuccessCard`, `WalletBadge`, skeleton loaders, and error boundary fallback. Each story includes accessibility checks via the axe-core panel.
+
+Build a static Storybook:
+
+```bash
+cd frontend
+npm run storybook:build
+```
+
+---
+
 ## Contributing
 
-We welcome contributions! Whether you want to report a bug, suggest an enhancement, or submit code changes, here's how to get started.
+We welcome contributions! Whether you want to report a bug, suggest an enhancement, or submit code changes, please read our full **[Contributor Guide (CONTRIBUTING.md)](CONTRIBUTING.md)** and **[Code of Conduct (CODE_OF_CONDUCT.md)](CODE_OF_CONDUCT.md)** to get started.
 
 ### Filing Issues
 
@@ -1039,6 +1885,43 @@ npm run dev
 | `contract` | Changes to the Soroban smart contract |
 | `frontend` | Changes to the Next.js frontend |
 | `deployment` | Changes to build or deploy scripts |
+| `dependencies` | Dependency updates (Dependabot) |
+| `security` | Security advisories and vulnerability fixes |
+| `major-update` | Major-version bump requiring manual review |
+
+### Dependency management (Dependabot)
+
+Dependabot is configured to open pull requests for outdated dependencies every Monday:
+
+| Ecosystem | Directory | Schedule | Grouping |
+|-----------|-----------|----------|----------|
+| npm | `frontend/` | Weekly (Monday) | `@stellar/*` grouped into one PR |
+| npm | `backend/` | Weekly (Monday) | — |
+| Cargo | `contracts/subscription/` | Weekly (Monday) | — |
+| GitHub Actions | `/` | Monthly | — |
+
+**Merge policy:**
+
+- **Patch and minor updates** — automatically approved and squash-merged once all CI checks pass. No manual action required.
+- **Major updates** — opened as a PR with the `major-update` label and left for manual review. CI must still pass before merge.
+- **GitHub Actions updates** — automatically approved and squash-merged (Actions use immutable tag or SHA pins; breaking changes do not follow semver).
+
+**Weekly security scanning (OPS-121):**
+
+A separate [security-audit workflow](.github/workflows/security-audit.yml) runs every Monday at 04:00 UTC independently of Dependabot PRs:
+
+- `npm audit --audit-level=high` in both `frontend/` and `backend/`
+- `cargo audit` in `contracts/subscription/`
+
+If any HIGH or CRITICAL advisory is found, the workflow fails and automatically opens a GitHub issue labelled `security` + `dependencies` so the team is alerted immediately. Audit reports are uploaded as workflow artifacts for detailed inspection.
+
+**Responding to security issues:**
+
+1. Check the opened issue for the advisory details and CVE link.
+2. For npm: run `npm audit fix` in the relevant directory, or pin to a safe version manually.
+3. For Cargo: update the crate version in `Cargo.toml`, run `cargo update`, and commit the updated `Cargo.lock`.
+4. If no fix exists yet, add an `[advisories]` ignore entry in `audit.toml` with a written justification and a link to the upstream issue.
+5. Close the GitHub issue once the advisory is resolved.
 
 ---
 
@@ -1046,11 +1929,78 @@ npm run dev
 
 | Guide | Description |
 |---|---|
+| [Soroban Events API](docs/events.md) | Comprehensive guide to all contract events: topics, payloads, integration examples |
+| [Storage TTL and Subscription Lifetime](docs/storage-ttl.md) | Complete guide to storage TTL management, subscription lifecycle, and cost implications |
 | [Storage TTL Management](docs/operations.md) | Detecting at-risk entries, extending TTL programmatically, alert thresholds |
 | [Network Configuration](docs/networks.md) | Testnet vs. mainnet side-by-side, common mistakes, switching guide |
 | [Backend API Cookbook](docs/api-cookbook.md) | 8 recipes: auth, subscriptions, webhooks, CSV export, MRR, TTL health |
 | [Release Process](docs/release-process.md) | Versioning rules, release note template, changelog process, step-by-step checklist |
+| [Freighter Troubleshooting](docs/freighter-troubleshooting.md) | Connection issues, signing failures, rejected transactions, contract errors, diagnostic checklist |
 | [Changelog](CHANGELOG.md) | Version history following Keep a Changelog format |
+
+---
+
+## Grafana Dashboard
+
+A pre-built Grafana dashboard for monitoring SorobanPay in production is provided at [`deploy/grafana/sorobanpay-dashboard.json`](deploy/grafana/sorobanpay-dashboard.json).
+
+### Dashboard Panels
+
+| # | Panel | Description |
+|---|-------|-------------|
+| 1 | **Events Indexed per Minute** | Rate of contract events (subscribe, executed, cancel, payment_transfer_failure) indexed per minute |
+| 2 | **Webhook Delivery Success Rate** | Percentage of webhook deliveries that received an HTTP 2xx response |
+| 3 | **RPC Poll Duration (p50/p95/p99)** | Latency of Soroban RPC `getEvents()` polling calls at the 50th, 95th, and 99th percentiles |
+| 4 | **Active Subscriptions** | Gauge of total active on-chain subscriptions tracked by the indexer |
+| 5 | **Payment Failure Rate** | Rate of `payment_transfer_failure` events per minute (insufficient-balance payments) |
+| 6 | **API Request Rate and Latency** | Backend REST API throughput (req/s) and p95 response latency |
+| 7 | **Pod CPU and Memory Usage** | CPU cores and memory (RSS) consumed by backend pods |
+| 8 | **DB Connection Pool Utilization** | Active vs. idle DB connections and pool utilization percentage |
+
+### Dashboard Variables
+
+| Variable | Description |
+|----------|-------------|
+| `datasource` | Prometheus datasource — select from the dropdown in the top-left |
+| `namespace` | Kubernetes namespace — auto-populated from the `sorobanpay_events_indexed_total` metric |
+
+### Importing the Dashboard
+
+**Via Grafana UI:**
+
+1. Open your Grafana instance and log in.
+2. In the left sidebar, click **Dashboards** → **Import**.
+3. Click **Upload dashboard JSON file** and select `deploy/grafana/sorobanpay-dashboard.json`.
+4. On the import screen, select your **Prometheus** datasource from the dropdown.
+5. Click **Import**.
+
+**Via Grafana API (automated):**
+
+```bash
+GRAFANA_URL=http://localhost:3000
+GRAFANA_TOKEN=<your-service-account-token>
+
+curl -X POST "$GRAFANA_URL/api/dashboards/import" \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $GRAFANA_TOKEN" \
+  -d "{
+    \"dashboard\": $(cat deploy/grafana/sorobanpay-dashboard.json),
+    \"overwrite\": true,
+    \"folderId\": 0,
+    \"inputs\": [{\"name\": \"DS_PROMETHEUS\", \"type\": \"datasource\", \"pluginId\": \"prometheus\", \"value\": \"Prometheus\"}]
+  }"
+```
+
+**Via Grafana provisioning (GitOps / Helm):**
+
+Copy the file into your provisioning directory and Grafana will auto-import it on startup:
+
+```bash
+cp deploy/grafana/sorobanpay-dashboard.json \
+   /etc/grafana/provisioning/dashboards/sorobanpay-dashboard.json
+```
+
+Ensure your provisioning config (`/etc/grafana/provisioning/dashboards/default.yaml`) has the `path` set to the directory above. The dashboard UID is `sorobanpay-overview`.
 
 ---
 

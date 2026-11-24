@@ -1,44 +1,67 @@
-export const RPC_URL =
-  process.env.NEXT_PUBLIC_RPC_URL ?? 'https://soroban-testnet.stellar.org';
+/**
+ * network.ts
+ *
+ * Network configuration constants for SorobanPay.
+ *
+ * Named string constants (`RPC_URL`, `NETWORK_PASSPHRASE`, etc.) are derived
+ * from the single source of truth: `@/lib/network_config` via
+ * `@/lib/runtime_config`. Do not hard-code passphrase or URL strings in
+ * components — import from here or directly from `@/lib/network_config`.
+ *
+ * ## Quick-start for new code
+ *
+ * ```ts
+ * // Preferred — typed config object, picks the active network automatically:
+ * import { getNetworkConfig } from '@/lib/network_config';
+ * const { rpcUrl, networkPassphrase, name } = getNetworkConfig();
+ *
+ * // Or pick a specific network:
+ * import { NETWORK_CONFIGS } from '@/lib/network_config';
+ * const testnet = NETWORK_CONFIGS.testnet;
+ * const mainnet = NETWORK_CONFIGS.mainnet;
+ * ```
+ *
+ * The flat constants below (`RPC_URL`, `NETWORK_PASSPHRASE`, …) are kept for
+ * backward compatibility with existing components. Prefer the typed API above
+ * in new code.
+ */
 
-export const NETWORK_PASSPHRASE =
-  process.env.NEXT_PUBLIC_NETWORK_PASSPHRASE ??
-  'Test SDF Network ; September 2015';
+import { getRuntimeConfig } from '@/lib/runtime_config';
 
-export const CONTRACT_ID =
-  process.env.NEXT_PUBLIC_CONTRACT_ID ?? '';
+// Re-export typed network API so consumers only need one import path.
+export {
+  getNetworkConfig,
+  resolveActiveNetwork,
+  isStellarNetwork,
+  NETWORK_CONFIGS,
+} from '@/lib/network_config';
+export type { StellarNetwork, NetworkConfig } from '@/lib/network_config';
 
-export const NETWORK_NAME =
-  NETWORK_PASSPHRASE === 'Public Global Stellar Network ; September 2015'
-    ? 'Mainnet'
-    : 'Testnet';
+// ── Flat constants (backward compatibility) ───────────────────────────────────
 
-// ── Transaction size limits ────────────────────────────────────────────────────
-//
-// These values match the Stellar protocol defaults for Soroban transactions.
-// Override via environment variables when running against a custom network.
-//
-// References:
-//   • MAX_OPERATIONS_PER_TX: Stellar protocol enforces max 100 operations per
-//     transaction envelope. Soroban transactions are further constrained to 1
-//     Soroban operation (the invoke call), but the outer limit is 100.
-//     Source: https://developers.stellar.org/docs/learn/fundamentals/stellar-consensus-protocol
-//   • MAX_TX_BYTE_SIZE: Soroban's configurable resource limit for transaction
-//     size. The protocol default for Soroban is 71,680 bytes (70 KB). The raw
-//     XDR envelope budget is set via ledger-wide `configSettingContract*`
-//     entries. 71680 is the default from stellar-core CAP-0046.
-//     Source: https://github.com/stellar/stellar-core CAP-0046 / CAP-0051
+// Get initial config at module load time.
+const _initialConfig = getRuntimeConfig();
 
-/** Maximum number of operations allowed in a single transaction envelope. */
-export const MAX_OPERATIONS_PER_TX: number = (() => {
-  const raw = process.env.NEXT_PUBLIC_MAX_OPERATIONS_PER_TX;
-  const parsed = raw !== undefined ? parseInt(raw, 10) : NaN;
-  return !isNaN(parsed) && parsed > 0 ? parsed : 100;
-})();
+/**
+ * Soroban RPC endpoint URL for the active network.
+ * @deprecated Use `getNetworkConfig().rpcUrl` instead.
+ */
+export const RPC_URL = _initialConfig.rpcUrl;
 
-/** Maximum allowed transaction size in bytes (XDR envelope). */
-export const MAX_TX_BYTE_SIZE: number = (() => {
-  const raw = process.env.NEXT_PUBLIC_MAX_TX_BYTE_SIZE;
-  const parsed = raw !== undefined ? parseInt(raw, 10) : NaN;
-  return !isNaN(parsed) && parsed > 0 ? parsed : 71_680;
-})();
+/**
+ * Stellar network passphrase for the active network.
+ * @deprecated Use `getNetworkConfig().networkPassphrase` instead.
+ */
+export const NETWORK_PASSPHRASE = _initialConfig.networkPassphrase;
+
+/**
+ * Deployed SorobanPay contract address.
+ * @deprecated Use `getRuntimeConfig().contractId` instead.
+ */
+export const CONTRACT_ID = _initialConfig.contractId;
+
+/**
+ * Display name of the active network (e.g. "Testnet", "Mainnet").
+ * @deprecated Use `getNetworkConfig().name` instead.
+ */
+export const NETWORK_NAME = _initialConfig.networkName;

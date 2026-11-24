@@ -2,11 +2,13 @@ use soroban_sdk::{contracttype, Address, BytesN, Env};
 
 // ==================== Version Metadata ====================
 
+/// Semantic version reported by the deployed contract.
 pub const CONTRACT_VERSION: &str = "1.0.0";
+/// Stable contract name used in deployment metadata.
 pub const CONTRACT_NAME: &str = "SorobanPay-SubscriptionProtocol";
 
 /// Current on-chain schema version.  Increment when `SubscriptionData` changes.
-pub const CURRENT_SCHEMA_VERSION: u32 = 1;
+pub const CURRENT_SCHEMA_VERSION: u32 = 2;
 
 // ==================== Key helpers ====================
 
@@ -48,6 +50,9 @@ pub enum DataKey {
 
     /// Designated admin address authorised to call `migrate`.
     Admin,
+
+    /// Optional maximum subscription amount for this deployment.
+    MaxAmount,
 }
 
 /// Persistent on-chain record for a subscription.
@@ -77,15 +82,62 @@ pub struct SubscriptionData {
     pub next_payment: u64,
     /// True when subscription payments are suspended
     pub is_paused:    bool,
+    /// Grace-period duration in seconds, if configured for this subscription.
+    pub grace_period: Option<u64>,
+    /// Timestamp until which payments are paused.
+    pub paused_until: Option<u64>,
+    /// Timestamp when the subscription first became overdue.
+    pub overdue_since: Option<u64>,
+}
+
+/// Subscription layout stored before schema version 2.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct LegacySubscriptionData {
+    /// SEP-41 token contract address used by the subscription.
+    pub token: Address,
+    /// Payment amount per interval in token base units.
+    pub amount: i128,
+    /// Seconds between payments.
+    pub interval: u64,
+    /// Unix timestamp at which the next payment becomes due.
+    pub next_payment: u64,
+    /// Whether payment collection is suspended.
+    pub is_paused: bool,
+}
+
+impl SubscriptionData {
+    /// Return the configured grace period in seconds, or zero when absent.
+    pub fn grace_period_secs(&self) -> u64 {
+        self.grace_period.unwrap_or(0)
+    }
+
+    /// Return the scheduled pause end timestamp, or zero when no end is set.
+    pub fn paused_until_ts(&self) -> u64 {
+        self.paused_until.unwrap_or(0)
+    }
+
+    /// Return the timestamp when the subscription became overdue, or zero if current.
+    pub fn overdue_since_ts(&self) -> u64 {
+        self.overdue_since.unwrap_or(0)
+    }
+
+    /// Return whether the subscription is paused at `now`.
+    ///
+    /// An explicit pause flag always pauses the subscription. A scheduled pause
+    /// also applies while `now` is earlier than its end timestamp.
+    pub fn is_paused(&self, now: u64) -> bool {
+        self.is_paused || self.paused_until.map(|until| until > now).unwrap_or(false)
+    }
 }
 
 /// Safe upper bound for a single subscription payment amount (1 × 10¹⁸ stroops).
 pub const MAX_AMOUNT: i128 = 1_000_000_000_000_000_000; // 1e18
 
-/// ~30 days at 5-second ledger close time (518_400 ledgers).
+/// Minimum storage TTL, approximately 30 days at a five-second ledger close time.
 pub const MIN_TTL_LEDGERS: u32 = 30 * 24 * 60 * 60 / 5;
 
-/// ~365 days at 5-second ledger close time (6_307_200 ledgers).
+/// Maximum storage TTL, approximately 365 days at a five-second ledger close time.
 pub const MAX_TTL_LEDGERS: u32 = 365 * 24 * 60 * 60 / 5;
 
 // ─── AdminConfig helpers ──────────────────────────────────────────────────────
