@@ -8,6 +8,13 @@ import {
   CacheKey,
   CACHE_TTL,
 } from '../lib/redis';
+import {
+  decodeCursor,
+  buildCursorWhere,
+  paginateRecords,
+  InvalidCursorError,
+} from '../utils/cursorPagination';
+import { serializeAmount } from '../utils/tokenAmount';
 
 const router = Router();
 
@@ -113,24 +120,65 @@ router.get('/', async (req: Request, res: Response) => {
     Math.max(parseInt((req.query.limit as string) ?? '20', 10) || 20, 1),
     100,
   );
+  const cursorParam = req.query.cursor as string | undefined;
+
+  let decodedCursor = null;
+  if (cursorParam) {
+    try {
+      decodedCursor = decodeCursor(cursorParam);
+    } catch (err) {
+      if (err instanceof InvalidCursorError) {
+        return res.status(400).json({ error: err.message, code: 'VALIDATION_ERROR' });
+      }
+      return res.status(400).json({ error: 'Invalid cursor parameter', code: 'VALIDATION_ERROR' });
+    }
+  }
 
   try {
-    const where = {
+    const baseWhere = {
       merchant: merchantAddress,
       ...(statusParam ? { status: statusParam } : {}),
     };
 
+    if (cursorParam && decodedCursor) {
+      const cursorWhere = buildCursorWhere(decodedCursor, 'createdAt', 'id');
+      const combinedWhere = { ...baseWhere, ...cursorWhere };
+
+      const [records, total] = await prisma.$transaction([
+        prisma.subscription.findMany({
+          where: combinedWhere,
+          orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+          take: limit + 1,
+        }),
+        prisma.subscription.count({ where: baseWhere }),
+      ]);
+
+      const paginated = paginateRecords(records, limit, total);
+      // Preserve exact token amounts
+      paginated.data = paginated.data.map((item: any) => ({
+        ...item,
+        amountFormatted: serializeAmount(item.amount),
+      }));
+
+      return res.json(paginated);
+    }
+
     const [data, total] = await prisma.$transaction([
       prisma.subscription.findMany({
-        where,
-        orderBy: { createdAt: 'desc' },
+        where: baseWhere,
+        orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
         skip: (page - 1) * limit,
         take: limit,
       }),
-      prisma.subscription.count({ where }),
+      prisma.subscription.count({ where: baseWhere }),
     ]);
 
-    return res.json({ data, total, page });
+    const formattedData = data.map((item: any) => ({
+      ...item,
+      amountFormatted: serializeAmount(item.amount),
+    }));
+
+    return res.json({ data: formattedData, total, page });
   } catch {
     return res.status(500).json({ error: 'Failed to fetch subscriptions' });
   }
