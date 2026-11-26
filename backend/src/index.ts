@@ -217,4 +217,13 @@ process.on('SIGTERM', async () => {
   process.exit(0);
 });
 
+export {
+  checkPendingMigrations,
+  runMigrationsWithLock,
+  acquireMigrationLock,
+  releaseMigrationLock,
+  MigrationLockTimeoutError,
+  type MigrationStatus,
+} from './services/migrationRunner';
+
 export default app;
