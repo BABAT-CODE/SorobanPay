@@ -2,6 +2,7 @@ import { Router, Request, Response } from 'express';
 import prisma from '../lib/prisma';
 import { getSubscriptionStatus } from '../services/subscriptionStateService';
 import { getRawRetries, cancelRetries } from '../services/retryQueue';
+import { idempotencyMiddleware } from '../middleware/idempotency';
 import {
   cacheGet,
   cacheSet,
@@ -10,6 +11,57 @@ import {
 } from '../lib/redis';
 
 const router = Router();
+
+router.use(idempotencyMiddleware());
+
+/**
+ * POST /api/v1/subscriptions
+ * Standardized subscription mutation route with idempotency support (#1583).
+ */
+router.post('/', async (req: Request, res: Response): Promise<void> => {
+  const { subscriber, merchant, token, amount, intervalSec } = req.body;
+  if (!subscriber || !merchant || !token || !amount) {
+    res.status(400).json({ error: 'subscriber, merchant, token, and amount are required' });
+    return;
+  }
+
+  try {
+    const subscription = await prisma.subscription.upsert({
+      where: {
+        subscriber_merchant: {
+          subscriber,
+          merchant,
+        },
+      },
+      update: {
+        token,
+        amount: String(amount),
+        intervalSec: intervalSec ? BigInt(intervalSec) : BigInt(86400),
+        status: 'ACTIVE',
+        updatedAt: new Date(),
+      },
+      create: {
+        subscriber,
+        merchant,
+        token,
+        amount: String(amount),
+        intervalSec: intervalSec ? BigInt(intervalSec) : BigInt(86400),
+        status: 'ACTIVE',
+        nextPayment: new Date(Date.now() + (intervalSec || 86400) * 1000),
+      },
+    });
+
+    res.status(201).json({
+      success: true,
+      subscription: {
+        ...subscription,
+        intervalSec: subscription.intervalSec.toString(),
+      },
+    });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message || 'Failed to create subscription' });
+  }
+});
 
 // ─── Issue #825: GET /api/v1/subscriptions ────────────────────────────────────
 // List Subscription records for the authenticated merchant.
