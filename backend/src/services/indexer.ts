@@ -18,6 +18,7 @@
 import { SorobanRpc, xdr } from '@stellar/stellar-sdk';
 import { Pool } from 'pg';
 import { getPool } from '../db/pool';
+import { RpcProviderPool } from './rpcProviderPool';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -38,6 +39,8 @@ export interface DecodedEvent {
 
 export interface IndexerConfig {
   rpcUrl: string;
+  rpcUrls?: string[];
+  rpcPool?: RpcProviderPool;
   contractId: string;
   pollIntervalMs?: number;
 }
@@ -54,7 +57,7 @@ const MAX_EVENTS_PER_PAGE = 100;
 // ---------------------------------------------------------------------------
 
 export class IndexerService {
-  private readonly rpc: SorobanRpc.Server;
+  private readonly rpcPool: RpcProviderPool;
   private readonly contractId: string;
   private readonly pollIntervalMs: number;
   private readonly pool: Pool;
@@ -62,7 +65,11 @@ export class IndexerService {
   private running = false;
 
   constructor(config: IndexerConfig) {
-    this.rpc = new SorobanRpc.Server(config.rpcUrl, { allowHttp: false });
+    this.rpcPool =
+      config.rpcPool ??
+      new RpcProviderPool({
+        endpoints: config.rpcUrls && config.rpcUrls.length > 0 ? config.rpcUrls : [config.rpcUrl],
+      });
     this.contractId = config.contractId;
     this.pollIntervalMs = config.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS;
     this.pool = getPool();
@@ -175,7 +182,7 @@ export class IndexerService {
       request.startLedger = 0;
     }
 
-    return this.rpc.getEvents(request);
+    return this.rpcPool.executeWithFailover(async (server) => server.getEvents(request));
   }
 
   // -------------------------------------------------------------------------
