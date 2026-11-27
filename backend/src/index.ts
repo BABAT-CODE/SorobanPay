@@ -48,7 +48,10 @@ const { port: PORT, rpcUrl, contractId } = config;
 const app = express();
 
 app.use(cors());
-app.use(express.json());
+// Explicit transport body limits (Issue #1591)
+const maxBodySize = process.env.MAX_BODY_SIZE ?? '100kb';
+app.use(express.json({ limit: maxBodySize }));
+app.use(express.urlencoded({ extended: true, limit: maxBodySize }));
 
 // Dynamic tenant middleware
 try {
