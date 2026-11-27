@@ -99,6 +99,8 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: contracts/subscription
+          prefix-key: release-rust-
+          save-if: ${{ github.event_name != 'pull_request' }}
 
       - name: Build Soroban WASM contract
         run: |
@@ -109,12 +111,27 @@ jobs:
             --release
           echo "✅ WASM build complete" >> "$GITHUB_STEP_SUMMARY"
 
+      - name: Compute immutable artifact digest
+        id: digest
+        run: |
+          WASM_PATH="contracts/target/wasm32-unknown-unknown/release/soroban_subscription_contract.wasm"
+          WASM_SHA256="$(sha256sum "$WASM_PATH" | awk '{print $1}')"
+          WASM_DIGEST="sha256:${WASM_SHA256}"
+          echo "wasm_digest=${WASM_DIGEST}" >> "$GITHUB_OUTPUT"
+          echo "- **WASM Digest:** \`${WASM_DIGEST}\`" >> "$GITHUB_STEP_SUMMARY"
+
       - name: Setup Node.js
+        id: setup-node
         uses: actions/setup-node@v4
         with:
           node-version: "20"
-          cache: npm
-          cache-dependency-path: frontend/package-lock.json
+
+      - name: Cache frontend npm dependencies
+        uses: actions/cache@v4
+        with:
+          path: ~/.npm
+          key: release-npm-${{ runner.os }}-node-${{ steps.setup-node.outputs.node-version }}-${{ hashFiles('frontend/package-lock.json') }}
+          lookup-only: ${{ github.event_name == 'pull_request' }}
 
       - name: Install frontend dependencies
         run: npm ci
@@ -478,29 +495,28 @@ jobs:
 
       - name: Write promotion audit log entry
         run: |
-          AUDIT_ENTRY=$(cat << EOF
-          {
-            "timestamp": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
-            "artifact_id": "${{ needs.build-artifact.outputs.artifact_id }}",
-            "git_sha": "${{ needs.build-artifact.outputs.git_sha }}",
-            "environment": "prod",
-            "promoted_from": "staging",
-            "workflow_run_id": "${{ github.run_id }}",
-            "actor": "${{ github.actor }}",
-            "status": "success"
-          }
-          EOF
-          )
+          bash scripts/verify-promotion-digest.sh record \
+            --output promotion-audit-prod.json \
+            --artifact-id "${{ needs.build-artifact.outputs.artifact_id }}" \
+            --digest "${{ needs.build-artifact.outputs.wasm_digest }}" \
+            --git-sha "${{ needs.build-artifact.outputs.git_sha }}" \
+            --environment "prod" \
+            --promoted-from "staging" \
+            --actor "${{ github.actor }}" \
+            --run-id "${{ github.run_id }}" \
+            --approval-status "approved"
           echo "## Production Deployment — Audit Log" >> "$GITHUB_STEP_SUMMARY"
           echo "\`\`\`json" >> "$GITHUB_STEP_SUMMARY"
-          echo "$AUDIT_ENTRY" >> "$GITHUB_STEP_SUMMARY"
+          cat promotion-audit-prod.json >> "$GITHUB_STEP_SUMMARY"
           echo "\`\`\`" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload promotion audit log
         uses: actions/upload-artifact@v7
         with:
           name: "promotion-audit-prod-${{ needs.build-artifact.outputs.artifact_id }}"
-          path: deployment.env
+          path: |
+            promotion-audit-prod.json
+            deployment.env
           retention-days: 365
 
       - name: Notify Slack — prod deployment
