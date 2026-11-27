@@ -24,7 +24,7 @@ rules, and step-by-step checklist — see [docs/release-process.md](docs/release
 
 ### Added
 
-- **[Docs]** Add data retention and deletion policy for application records, mapping data categories to retention rules, owners, and deletion paths while protecting on-chain ledger immutability and financial reconciliation records. (Closes #1631)
+- **[Frontend]** Cancel obsolete API requests when wallet context changes. (Closes #1575)
 
 - **[Docs]** Complete the Keep a Changelog release history, architecture guide,
   and Rust contract API documentation. (Closes #1405, Closes #1406, Closes #1407)
