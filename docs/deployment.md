@@ -916,23 +916,18 @@ This is why testnet validation and thorough testing are mandatory before every m
 
 ---
 
-## 10. Pre-Deploy Database Migration Compatibility Gate
+## Workflow Concurrency & Rollout Safety
 
-Rolling deployments require database migrations to remain backward-compatible with currently running application instances. The CI workflow [`.github/workflows/migration-compatibility-gate.yml`](../.github/workflows/migration-compatibility-gate.yml) runs [`backend/src/lib/migrationCompatibilityCli.ts`](../backend/src/lib/migrationCompatibilityCli.ts) on all changed SQL migration files (`backend/migrations/*.sql`, `backend/src/db/schema.sql`, `backend/audit-trail/schema.sql`).
+Deployment workflows use environment-scoped GitHub Actions `concurrency` groups to prevent out-of-order deployments and race conditions:
 
-### Classification Rules
+| Workflow | Concurrency Group | `cancel-in-progress` | Behavior |
+|---|---|---|---|
+| `.github/workflows/deploy-testnet.yml` | `deploy-testnet-${{ github.ref }}` | `true` | Cancels superseded testnet preview/push runs on the same ref; `verify-rollout` fails the run if any upstream job was canceled or failed so partial rollouts are never marked successful. |
+| `.github/workflows/testnet-deploy.yml` | `testnet-deployment` | `false` | Queues concurrent testnet deployments instead of interrupting an active contract/frontend deploy. |
+| `.github/workflows/promotion-pipeline.yml` | `promotion-${{ github.ref }}` | `false` | Queues concurrent promotion runs so staging and production releases are never silently interrupted. |
 
-- **Compatible (Expand)**: `CREATE TABLE`, `ADD COLUMN` (nullable or with `DEFAULT`), and `CREATE INDEX CONCURRENTLY`.
-- **Warning (Lock Risk)**: `CREATE INDEX` without `CONCURRENTLY` (logged as a warning; use `CONCURRENTLY` to avoid write locks).
-- **Incompatible (Blocked)**: `DROP TABLE`, `DROP COLUMN`, `RENAME COLUMN`, `RENAME TO`, `ALTER COLUMN ... TYPE`, `SET NOT NULL`, `ADD COLUMN ... NOT NULL` without `DEFAULT`, and `TRUNCATE`.
+### Partial Rollout Protection
+In `deploy-testnet.yml`, the `verify-rollout` job runs with `if: ${{ always() }}` after `deploy-contract` and `deploy-frontend`. If either job is canceled or fails, `verify-rollout` exits non-zero, ensuring a canceled run cannot leave a partial rollout marked as successful.
 
-When an incompatible operation is detected, the gate fails and reports the exact file, line number, rule ID, operation, and expand-and-contract remediation guidance.
-
-### Documented Override Process
-
-If a destructive or contract-phase migration is intentional (for example, dropping a column after all readers have been removed in an earlier release), an override requires **both** an explicit approver and a rationale of at least 10 characters:
-
-- `MIGRATION_OVERRIDE_APPROVER`: Explicit approver handle or email (e.g., `@platform-lead`).
-- `MIGRATION_OVERRIDE_RATIONALE`: Clear justification explaining why the operation is safe for active instances.
-
-Overrides missing either field are rejected by the gate.
+### Automated Verification
+Run `bash tests/workflow_concurrency_test.sh` (also executed in `.github/workflows/deployment-smoke.yml`) to verify that all deployment workflows maintain their expected concurrency groups, cancellation settings, and rollout guards.

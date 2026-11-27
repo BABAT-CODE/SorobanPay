@@ -412,20 +412,11 @@ Changes to `deploy/deploy.sh` or CI workflows are released as `PATCH` or `MINOR`
 - [ ] Mark any issues resolved by this release as closed with the release tag.
 - [ ] Review and triage any issues opened since the last release.
 
-## Provenance Attestations & Production Promotion Gate
+## Immutable Digest Retention & Rollback
 
-Release artifacts and container images built by `.github/workflows/promotion-pipeline.yml` generate:
+All promoted release artifacts are tracked by immutable `sha256:<64-hex-chars>` digest rather than mutable image tags:
 
-1. **Artifact Metadata (`artifact-manifest.json`)**: Records the source commit (`git_sha`), build workflow (`build_workflow`), workflow run ID (`workflow_run_id`), and dependency inventory reference (`dependency_inventory`).
-2. **Software Bill of Materials (`sbom-inventory.json`)**: CycloneDX 1.5 dependency inventory for the release components.
-3. **Build Provenance Attestation**: Signed SLSA provenance generated via `actions/attest-build-provenance@v2` during the `build-artifact` job.
-
-### Production Verification
-
-Before promoting to production (`deploy-prod`), the pipeline runs `scripts/verify-image-attestation.sh` with `--verify-gh-attestation` to enforce that:
-- The artifact manifest and SBOM exist and are valid JSON.
-- The source commit (`git_sha`) and build workflow (`build_workflow`) match the trusted pipeline run.
-- The dependency inventory (`components`) is non-empty.
-- The cryptographic provenance attestation verifies against the repository via `gh attestation verify`.
-
-Promotions without a valid, trusted attestation are rejected.
+- **Checkpoint creation**: `bash deploy/rollback.sh --create-checkpoint <contract_id> <image_tag> <image_digest> [source_revision]` validates the `sha256:` digest and retains `previous_digest` from the prior validated checkpoint.
+- **Deployment recording**: `bash deploy/rollback.sh --record-deployment <environment> <image_digest> <source_revision> [release_notes_file]` updates `deploy/deployments.json` with `current_digest`, `previous_digest`, `source_revision`, and `updated_at`, and optionally appends the deployed digest and source revision to release notes.
+- **Status inspection**: `bash deploy/rollback.sh --status <environment>` prints the current digest, previous known-good digest, and source revision.
+- **Digest-verified rollback**: `bash deploy/rollback.sh --rollback [checkpoint_file]` validates the immutable digest before rolling back Kubernetes deployments (`<image>@<digest>`), failing if no validated digest is present.
